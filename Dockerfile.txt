@@ -1,0 +1,21 @@
+# Usa uma imagem leve do Python
+FROM python:3.9-slim
+
+# Define a pasta de trabalho
+WORKDIR /app
+
+# Copia os requisitos e instala
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia o código do app
+COPY . .
+
+# Cria a pasta temporária para uploads
+RUN mkdir -p /app/temp_files
+
+# Expõe a porta 80
+EXPOSE 80
+
+# Comando para rodar o servidor
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
