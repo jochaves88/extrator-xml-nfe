@@ -29,7 +29,7 @@ def pegar_valor(no, caminho, tipo=str):
     except:
         return tipo(0) if tipo in [float, int] else ""
 
-# --- MOTOR DE EXTRAÇÃO (AGORA COMPLETO) ---
+# --- MOTOR DE EXTRAÇÃO ---
 def processar_xmls(pasta_xml):
     arquivos = glob.glob(f"{pasta_xml}/**/*.xml", recursive=True)
     arquivos += glob.glob(f"{pasta_xml}/**/*.XML", recursive=True)
@@ -63,13 +63,12 @@ def processar_xmls(pasta_xml):
             data_nfe = data_raw[:10]
             ano, mes = data_nfe[:4], data_nfe[5:7]
 
-            # --- LOOP DOS PRODUTOS (COM TODOS OS CAMPOS) ---
+            # --- LOOP DOS PRODUTOS ---
             dets = inf_nfe.findall('nfe:det', ns)
             for det in dets:
                 prod = det.find('nfe:prod', ns)
                 imposto = det.find('nfe:imposto', ns)
                 
-                # Variáveis de Imposto do ITEM
                 cst_csosn = ""
                 bc_icms_item = 0.0
                 aliq_icms_item = 0.0
@@ -78,7 +77,6 @@ def processar_xmls(pasta_xml):
                 vr_ipi_item = 0.0
                 
                 if imposto is not None:
-                    # ICMS / CST / CSOSN
                     icms_node = imposto.find('nfe:ICMS', ns)
                     if icms_node:
                         for child in icms_node:
@@ -87,7 +85,6 @@ def processar_xmls(pasta_xml):
                             aliq_icms_item = pegar_valor(child, 'nfe:pICMS', float)
                             vr_icms_item = pegar_valor(child, 'nfe:vICMS', float)
 
-                    # IPI
                     ipi_node = imposto.find('nfe:IPI', ns)
                     if ipi_node:
                         ipitrib = ipi_node.find('nfe:IPITrib', ns)
@@ -95,11 +92,10 @@ def processar_xmls(pasta_xml):
                             aliq_ipi_item = pegar_valor(ipitrib, 'nfe:pIPI', float)
                             vr_ipi_item = pegar_valor(ipitrib, 'nfe:vIPI', float)
 
-                # --- MONTAGEM DA LINHA (TODAS AS COLUNAS) ---
                 item = {
                     'Mês': mes,
                     'Ano': ano,
-                    'Chave Acesso NFe': "'" + chave,
+                    'Chave Acesso NFe': chave,  # <--- CORRIGIDO AQUI (Tirei o aspas simples)
                     'Inscrição Destinatário': pegar_valor(dest, 'nfe:IE'),
                     'Inscrição Emitente': pegar_valor(emit, 'nfe:IE'),
                     'Razão Social Emitente': pegar_valor(emit, 'nfe:xNome'),
@@ -109,7 +105,6 @@ def processar_xmls(pasta_xml):
                     'Série': pegar_valor(ide, 'nfe:serie'),
                     'Data NFe': data_nfe,
                     
-                    # Totais da Nota
                     'BC ICMS Total': pegar_valor(total_icms, 'nfe:vBC', float),
                     'ICMS Total': pegar_valor(total_icms, 'nfe:vICMS', float),
                     'BC ST Total': pegar_valor(total_icms, 'nfe:vBCST', float),
@@ -119,7 +114,6 @@ def processar_xmls(pasta_xml):
                     'Total Produtos': pegar_valor(total_icms, 'nfe:vProd', float),
                     'Total NFe': pegar_valor(total_icms, 'nfe:vNF', float),
                     
-                    # Dados do Produto
                     'Descrição Produto NFe': pegar_valor(prod, 'nfe:xProd'),
                     'NCM na NFe': pegar_valor(prod, 'nfe:NCM'),
                     'CST': cst_csosn,
@@ -130,7 +124,6 @@ def processar_xmls(pasta_xml):
                     'Vr Total': pegar_valor(prod, 'nfe:vProd', float),
                     'Desconto Item': pegar_valor(prod, 'nfe:vDesc', float),
                     
-                    # Impostos do Item
                     'Base de Cálculo ICMS': bc_icms_item,
                     'Aliq ICMS': aliq_icms_item,
                     'Vr ICMS': vr_icms_item,
@@ -141,7 +134,7 @@ def processar_xmls(pasta_xml):
         except Exception as e:
             erros.append(f"Erro em {os.path.basename(arq)}: {str(e)}")
 
-    # --- ORDENAÇÃO E PREPARAÇÃO PARA EXPORTAÇÃO ---
+    # --- DATAFRAME FINAL ---
     colunas_ordem = [
         'Mês', 'Ano', 'Chave Acesso NFe', 'Inscrição Destinatário', 'Inscrição Emitente', 
         'Razão Social Emitente', 'Cnpj Emitente', 'UF Emitente', 'Nr NFe', 'Série', 'Data NFe', 
@@ -153,24 +146,16 @@ def processar_xmls(pasta_xml):
     
     df = pd.DataFrame(dados)
     
-    # Garante a ordem e existência das colunas
     if not df.empty:
         for col in colunas_ordem:
             if col not in df.columns: df[col] = ""
         df = df[colunas_ordem]
 
-    # --- ESTATÍSTICAS PARA O DASHBOARD ---
+    # --- ESTATÍSTICAS ---
     stats = {}
     if not df.empty:
-        # Conta notas únicas (baseado na chave de acesso)
         notas_unicas = df.drop_duplicates(subset=['Chave Acesso NFe'])
         
-        # Totais
-        qtd_notas = len(notas_unicas)
-        valor_total_notas = notas_unicas['Total NFe'].sum()
-        qtd_produtos = len(df)
-        
-        # Agrupamento por Mês
         por_periodo = notas_unicas.groupby(['Ano', 'Mês']).agg(
             Qtd_Notas=('Chave Acesso NFe', 'count'),
             Valor_Total=('Total NFe', 'sum')
@@ -179,25 +164,24 @@ def processar_xmls(pasta_xml):
         stats = {
             'sucesso': True,
             'qtd_arquivos_lidos': len(arquivos),
-            'qtd_notas_unicas': qtd_notas,
-            'qtd_produtos_total': qtd_produtos,
-            'valor_total_geral': valor_total_notas,
+            'qtd_notas_unicas': len(notas_unicas),
+            'qtd_produtos_total': len(df),
+            'valor_total_geral': notas_unicas['Total NFe'].sum(),
             'periodos': por_periodo,
             'erros': erros
         }
     else:
-        stats = {'sucesso': False, 'msg': 'Nenhuma nota processada com sucesso.'}
+        stats = {'sucesso': False, 'msg': 'Nenhuma nota encontrada.'}
 
     return df, stats
 
 # --- ROTAS ---
-
 @app.get("/download")
 async def download_excel():
     file_path = os.path.join(temp_dir, output_filename)
     if os.path.exists(file_path):
         return FileResponse(file_path, filename=output_filename, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    return {"error": "Arquivo não processado ainda."}
+    return {"error": "Arquivo não processado."}
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -216,13 +200,11 @@ async def upload_file(file: UploadFile = File(...)):
         
     df, stats = processar_xmls(temp_dir)
     
-    # Salva o Excel Completo
     excel_path = os.path.join(temp_dir, output_filename)
     df.to_excel(excel_path, index=False)
     
     return JSONResponse(stats)
 
-# --- FRONTEND (HTML DASHBOARD IGUAL AO ANTERIOR) ---
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
