@@ -1,7 +1,26 @@
 version: '3.8'
+
 services:
-  web:
+  app:
+    image: extrator-xml:latest
     build: .
     ports:
       - "80:80"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/nfe_db
     restart: always
+
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: nfe_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+volumes:
+  postgres_data:
