@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   app:
-    image: extrator-xml:latest
+   # image: extrator-xml:latest
     build: .
     ports:
       - "80:80"
