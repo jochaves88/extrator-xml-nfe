@@ -9,170 +9,185 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 app = FastAPI()
 
-# --- LÓGICA DE EXTRAÇÃO ROBUSTA ---
+# --- CONFIGURAÇÃO ---
 ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 def pegar_valor(no, caminho, tipo=str):
-    """Busca valor de forma segura. Se der erro, retorna vazio ou zero."""
+    """Busca valor de forma segura. Retorna 0.0 para numeros se nao encontrar."""
     if no is None: return tipo(0) if tipo in [float, int] else ""
     try:
         r = no.find(caminho, ns)
         if r is not None and r.text:
-            return tipo(r.text)
+            return tipo(r.text.replace(',', '.'))
         return tipo(0) if tipo in [float, int] else ""
     except:
         return tipo(0) if tipo in [float, int] else ""
 
 def processar_xmls(pasta_xml):
-    # Busca recursiva por .xml ou .XML
     arquivos = glob.glob(f"{pasta_xml}/**/*.xml", recursive=True)
     arquivos += glob.glob(f"{pasta_xml}/**/*.XML", recursive=True)
     
     dados = []
-    print(f"Total de arquivos encontrados: {len(arquivos)}") # Log para o Portainer
+    print(f"Iniciando processamento de {len(arquivos)} arquivos...")
     
     for arq in arquivos:
         try:
             tree = ET.parse(arq)
             root = tree.getroot()
             
-            # Ajuste para encontrar a tag correta (NFe normal ou NFeProcessada)
+            # Ajuste de namespace para NFeProc ou NFe pura
             if root.tag.endswith('nfeProc'):
                 inf_nfe = root.find('nfe:NFe/nfe:infNFe', ns)
             else:
                 inf_nfe = root.find('nfe:infNFe', ns)
             
-            if inf_nfe is None:
-                print(f"ALERTA: Arquivo ignorado (não parece NFe): {arq}")
-                continue
+            if inf_nfe is None: continue
 
-            # --- BLOCOS DE DADOS ---
+            # --- BLOCOS PRINCIPAIS ---
             ide = inf_nfe.find('nfe:ide', ns)
             emit = inf_nfe.find('nfe:emit', ns)
             dest = inf_nfe.find('nfe:dest', ns)
-            total = inf_nfe.find('nfe:total/nfe:ICMSTot', ns)
+            total_icms = inf_nfe.find('nfe:total/nfe:ICMSTot', ns) # Totais da Nota
             
-            # Tratamento da Chave
+            # --- DADOS GERAIS DA NOTA ---
             chave = pegar_valor(root.find('nfe:protNFe/nfe:infProt', ns), 'nfe:chNFe')
-            if not chave: 
-                chave = inf_nfe.attrib.get('Id', '')[3:]
-
-            # Tratamento da Data (Emissão ou Saída)
+            if not chave: chave = inf_nfe.attrib.get('Id', '')[3:]
+            
             data_raw = pegar_valor(ide, 'nfe:dhEmi')
             if not data_raw: data_raw = pegar_valor(ide, 'nfe:dEmi')
-            data_nfe = data_raw[:10]
+            data_nfe = data_raw[:10] # Formato AAAA-MM-DD
             
-            # --- LOOP DOS ITENS (PRODUTOS) ---
+            # Mes e Ano
+            ano = data_nfe[:4]
+            mes = data_nfe[5:7]
+
+            # --- LOOP DE PRODUTOS ---
             dets = inf_nfe.findall('nfe:det', ns)
             for det in dets:
                 prod = det.find('nfe:prod', ns)
                 imposto = det.find('nfe:imposto', ns)
                 
-                # Buscando impostos (ICMS, IPI, PIS, COFINS) varrendo os filhos
-                v_icms = 0.0
-                v_ipi = 0.0
-                v_pis = 0.0
-                v_cofins = 0.0
+                # Variaveis de Imposto do ITEM (zeradas por padrao)
+                cst_csosn = ""
+                bc_icms_item = 0.0
+                aliq_icms_item = 0.0
+                vr_icms_item = 0.0
+                aliq_ipi_item = 0.0
+                vr_ipi_item = 0.0
                 
+                # Busca Inteligente de CST/CSOSN e ICMS
                 if imposto is not None:
-                    # ICMS (pode estar dentro de ICMS00, ICMS20, etc...)
                     icms_node = imposto.find('nfe:ICMS', ns)
                     if icms_node:
-                        for child in icms_node: # Varre qualquer filho (ICMS00, CSOSN101...)
-                            val = child.find('nfe:vICMS', ns)
-                            if val is not None: v_icms = float(val.text)
-                    
-                    # IPI
+                        for child in icms_node:
+                            # Tenta pegar CST ou CSOSN
+                            cst_csosn = pegar_valor(child, 'nfe:CST')
+                            if not cst_csosn: cst_csosn = pegar_valor(child, 'nfe:CSOSN')
+                            
+                            # Valores do ICMS Item
+                            bc_icms_item = pegar_valor(child, 'nfe:vBC', float)
+                            aliq_icms_item = pegar_valor(child, 'nfe:pICMS', float)
+                            vr_icms_item = pegar_valor(child, 'nfe:vICMS', float)
+
+                    # Busca IPI
                     ipi_node = imposto.find('nfe:IPI', ns)
                     if ipi_node:
                         ipitrib = ipi_node.find('nfe:IPITrib', ns)
                         if ipitrib:
-                            val = ipitrib.find('nfe:vIPI', ns)
-                            if val is not None: v_ipi = float(val.text)
+                            aliq_ipi_item = pegar_valor(ipitrib, 'nfe:pIPI', float)
+                            vr_ipi_item = pegar_valor(ipitrib, 'nfe:vIPI', float)
 
-                    # PIS
-                    pis_node = imposto.find('nfe:PIS', ns)
-                    if pis_node:
-                        for child in pis_node:
-                            val = child.find('nfe:vPIS', ns)
-                            if val is not None: v_pis = float(val.text)
-
-                    # COFINS
-                    cofins_node = imposto.find('nfe:COFINS', ns)
-                    if cofins_node:
-                        for child in cofins_node:
-                            val = child.find('nfe:vCOFINS', ns)
-                            if val is not None: v_cofins = float(val.text)
-
+                # --- MONTAGEM DA LINHA ---
                 item = {
-                    'Chave Acesso': "'" + chave,
-                    'Numero NFe': pegar_valor(ide, 'nfe:nNF'),
-                    'Serie': pegar_valor(ide, 'nfe:serie'),
-                    'Data Emissao': data_nfe,
-                    'Natureza Op': pegar_valor(ide, 'nfe:natOp'),
-                    
-                    # Emitente
-                    'CNPJ Emitente': pegar_valor(emit, 'nfe:CNPJ'),
-                    'Nome Emitente': pegar_valor(emit, 'nfe:xNome'),
+                    'Mês': mes,
+                    'Ano': ano,
+                    'Chave Acesso NFe': "'" + chave,
+                    'Inscrição Destinatário': pegar_valor(dest, 'nfe:IE'),
+                    'Inscrição Emitente': pegar_valor(emit, 'nfe:IE'),
+                    'Razão Social Emitente': pegar_valor(emit, 'nfe:xNome'),
+                    'Cnpj Emitente': pegar_valor(emit, 'nfe:CNPJ'),
                     'UF Emitente': pegar_valor(emit, 'nfe:enderEmit/nfe:UF'),
+                    'Nr NFe': pegar_valor(ide, 'nfe:nNF'),
+                    'Série': pegar_valor(ide, 'nfe:serie'),
+                    'Data NFe': data_nfe,
                     
-                    # Destinatario
-                    'CNPJ Destinatario': pegar_valor(dest, 'nfe:CNPJ') or pegar_valor(dest, 'nfe:CPF'),
-                    'Nome Destinatario': pegar_valor(dest, 'nfe:xNome'),
-                    'UF Destinatario': pegar_valor(dest, 'nfe:enderDest/nfe:UF'),
+                    # Totais da Nota (Cabecalho)
+                    'BC ICMS Total': pegar_valor(total_icms, 'nfe:vBC', float),
+                    'ICMS Total': pegar_valor(total_icms, 'nfe:vICMS', float),
+                    'BC ST Total': pegar_valor(total_icms, 'nfe:vBCST', float),
+                    'ICMS ST Total': pegar_valor(total_icms, 'nfe:vST', float),
+                    'Desc Total': pegar_valor(total_icms, 'nfe:vDesc', float),
+                    'IPI Total': pegar_valor(total_icms, 'nfe:vIPI', float),
+                    'Total Produtos': pegar_valor(total_icms, 'nfe:vProd', float),
+                    'Total NFe': pegar_valor(total_icms, 'nfe:vNF', float),
                     
-                    # Produto
-                    'Codigo Produto': pegar_valor(prod, 'nfe:cProd'),
-                    'Descricao': pegar_valor(prod, 'nfe:xProd'),
-                    'NCM': pegar_valor(prod, 'nfe:NCM'),
-                    'CFOP': pegar_valor(prod, 'nfe:CFOP'),
-                    'Unidade': pegar_valor(prod, 'nfe:uCom'),
-                    'Quantidade': pegar_valor(prod, 'nfe:qCom', float),
-                    'Valor Unitario': pegar_valor(prod, 'nfe:vUnCom', float),
-                    'Valor Total Item': pegar_valor(prod, 'nfe:vProd', float),
+                    # Dados do Produto (Item)
+                    'Descrição Produto NFe': pegar_valor(prod, 'nfe:xProd'),
+                    'NCM na NFe': pegar_valor(prod, 'nfe:NCM'),
+                    'CST': cst_csosn,
+                    'CFOP NFe': pegar_valor(prod, 'nfe:CFOP'),
+                    'Qtde': pegar_valor(prod, 'nfe:qCom', float),
+                    'Unid': pegar_valor(prod, 'nfe:uCom'),
+                    'Vr Unit': pegar_valor(prod, 'nfe:vUnCom', float),
+                    'Vr Total': pegar_valor(prod, 'nfe:vProd', float), # Valor total do produto
+                    'Desconto Item': pegar_valor(prod, 'nfe:vDesc', float),
                     
-                    # Impostos Item
-                    'Valor ICMS': v_icms,
-                    'Valor IPI': v_ipi,
-                    'Valor PIS': v_pis,
-                    'Valor COFINS': v_cofins,
-                    
-                    # Totais Nota
-                    'Total Nota': pegar_valor(total, 'nfe:vNF', float)
+                    # Impostos do Item
+                    'Base de Cálculo ICMS': bc_icms_item,
+                    'Aliq ICMS': aliq_icms_item,
+                    'Vr ICMS': vr_icms_item,
+                    'Aliq IPI': aliq_ipi_item,
+                    'Vr IPI': vr_ipi_item
                 }
                 dados.append(item)
+                
         except Exception as e:
-            # AQUI ESTA A MAGICA: Se der erro, ele avisa qual arquivo foi
-            print(f"ERRO CRITICO no arquivo {arq}: {e}")
+            print(f"Erro ao ler arquivo {arq}: {e}")
             pass
             
+    # Criar DataFrame na ordem exata solicitada
+    colunas_ordem = [
+        'Mês', 'Ano', 'Chave Acesso NFe', 'Inscrição Destinatário', 'Inscrição Emitente', 
+        'Razão Social Emitente', 'Cnpj Emitente', 'UF Emitente', 'Nr NFe', 'Série', 'Data NFe', 
+        'BC ICMS Total', 'ICMS Total', 'BC ST Total', 'ICMS ST Total', 'Desc Total', 'IPI Total', 
+        'Total Produtos', 'Total NFe', 'Descrição Produto NFe', 'NCM na NFe', 'CST', 'CFOP NFe', 
+        'Qtde', 'Unid', 'Vr Unit', 'Vr Total', 'Desconto Item', 'Base de Cálculo ICMS', 
+        'Aliq ICMS', 'Vr ICMS', 'Aliq IPI', 'Vr IPI'
+    ]
+    
     df = pd.DataFrame(dados)
+    
+    # Reordenar colunas (se existirem dados)
+    if not df.empty:
+        # Garante que todas colunas existem mesmo se vazias
+        for col in colunas_ordem:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[colunas_ordem]
+        
     return df
 
-# --- ROTAS DO SITE ---
-
+# --- ROTAS (MANTIDAS IGUAIS) ---
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
     <html>
         <head>
-            <title>Extrator PRO V2</title>
+            <title>Extrator XML - Personalizado</title>
             <style>
-                body { font-family: 'Segoe UI', sans-serif; text-align: center; padding: 50px; background: #2c3e50; color: white; }
-                .box { background: white; color: #333; padding: 40px; border-radius: 10px; display: inline-block; max-width: 500px; }
-                button { background: #e67e22; color: white; border: none; padding: 15px 30px; font-size: 18px; cursor: pointer; border-radius: 5px; width: 100%; }
-                button:hover { background: #d35400; }
-                input { margin-bottom: 20px; padding: 10px; width: 100%; box-sizing: border-box;}
+                body { font-family: sans-serif; text-align: center; padding: 50px; background: #2c3e50; color: white;}
+                .box { background: white; color: #333; padding: 40px; border-radius: 8px; display: inline-block; }
+                button { background: #27ae60; color: white; border: none; padding: 15px 30px; font-size: 16px; cursor: pointer; border-radius: 5px; }
             </style>
         </head>
         <body>
             <div class="box">
-                <h1>Extrator de XML 2.0 ⚡</h1>
-                <p>Extração completa com impostos e detalhes.</p>
+                <h1>Extrator de XML 3.0 🚀</h1>
+                <p>Relatório com layout personalizado.</p>
                 <form action="/upload" method="post" enctype="multipart/form-data">
                     <input type="file" name="file" accept=".zip" required>
-                    <br>
-                    <button type="submit">Processar Arquivos</button>
+                    <br><br>
+                    <button type="submit">Gerar Relatório Excel</button>
                 </form>
             </div>
         </body>
@@ -193,14 +208,11 @@ async def upload_file(file: UploadFile = File(...)):
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(temp_dir)
     except:
-        return HTMLResponse("<h1>Erro: O arquivo enviado não é um ZIP válido.</h1>")
+        return HTMLResponse("<h1>Erro: Arquivo ZIP inválido.</h1>")
         
     df = processar_xmls(temp_dir)
     
-    if df.empty:
-        return HTMLResponse("<h1>Erro: Nenhuma nota encontrada ou erro na leitura. Verifique os Logs no Portainer.</h1>")
-
-    output_file = "Relatorio_Completo.xlsx"
+    output_file = "Relatorio_Personalizado.xlsx"
     df.to_excel(output_file, index=False)
     
-    return FileResponse(output_file, filename="Relatorio_Completo.xlsx", media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    return FileResponse(output_file, filename="Relatorio_Personalizado.xlsx", media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
