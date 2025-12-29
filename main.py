@@ -6,111 +6,107 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from sqlalchemy import create_engine, Column, String, Float, Integer, Date, text
+from sqlalchemy import create_engine, Column, String, Float, Date, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 
 app = FastAPI()
 
-# --- CONFIGURAÇÃO DO BANCO DE DADOS ---
-# Pega a URL do docker-compose ou usa local para testes
+# --- 1. CONFIGURAÇÃO DO BANCO DE DADOS ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELO DA TABELA (A ESTRUTURA DOS DADOS) ---
 class NFe(Base):
     __tablename__ = "notas_fiscais"
-    
-    # A Chave é a identidade única. Se repetir, atualizamos.
-    chave = Column(String, primary_key=True, index=True)
+    # Chave composta (Chave NFe + Numero Item) para evitar duplicidade de itens
+    chave_item = Column(String, primary_key=True, index=True) 
+    chave_acesso = Column(String)
     mes = Column(String)
     ano = Column(String)
     data_emissao = Column(Date)
-    
-    emitente_nome = Column(String)
-    emitente_cnpj = Column(String)
-    destinatario_nome = Column(String)
-    
-    numero_nf = Column(String)
-    valor_total = Column(Float)
-    
-    # Dados do Produto (Resumido para o filtro, o detalhe JSON guarda o resto se precisar)
-    produto_nome = Column(String)
-    ncm = Column(String)
-    cfop = Column(String)
-    qtd = Column(Float)
-    valor_unit = Column(Float)
-    valor_total_item = Column(Float)
-    
-    # Impostos
-    icms_total = Column(Float)
-    ipi_total = Column(Float)
-    # ... Podemos adicionar todas as 33 colunas aqui, mas vamos focar no essencial para o banco
-    # Para o Excel final, vamos remontar tudo.
-    
-    # Guarda todos os dados brutos para gerar o excel completo depois
-    dados_json = Column(String) 
+    valor_total_nota = Column(Float) # Valor total da NF (cabeçalho)
+    valor_item = Column(Float)       # Valor deste item específico
+    dados_json = Column(String)      # Dicionário completo para o Excel
 
-# Cria a tabela no banco se não existir
 Base.metadata.create_all(bind=engine)
 
-# --- FUNÇÕES XML (MANTIDAS) ---
-ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+# --- 2. FUNÇÕES XML OTIMIZADAS ---
+# Namespaces comuns em NFe (ajuda a evitar erros de leitura)
+ns_map = {
+    'nfe': 'http://www.portalfiscal.inf.br/nfe',
+    'default': 'http://www.portalfiscal.inf.br/nfe' 
+}
 
 def pegar_valor(no, caminho, tipo=str):
+    """Busca valor tentando com e sem namespace para garantir"""
     if no is None: return tipo(0) if tipo in [float, int] else ""
-    try:
-        r = no.find(caminho, ns)
-        if r is not None and r.text:
-            return tipo(r.text.replace(',', '.'))
-        return tipo(0) if tipo in [float, int] else ""
-    except:
-        return tipo(0) if tipo in [float, int] else ""
+    
+    # Tenta encontrar com o namespace padrão
+    r = no.find(caminho, ns_map)
+    # Se não achar, tenta sem namespace (alguns XMLs antigos vêm assim)
+    if r is None:
+        caminho_sem_ns = caminho.replace('nfe:', '')
+        r = no.find(caminho_sem_ns)
+    
+    if r is not None and r.text:
+        val = r.text.replace(',', '.')
+        try:
+            return tipo(val)
+        except:
+            return tipo(0) if tipo in [float, int] else ""
+    return tipo(0) if tipo in [float, int] else ""
+
+def formatar_data(data_obj):
+    """Retorna data no formato BR (dd/mm/aaaa) para o Excel"""
+    return data_obj.strftime('%d/%m/%Y')
 
 def extrair_dados_xml(arq):
     try:
         tree = ET.parse(arq)
         root = tree.getroot()
-        if root.tag.endswith('nfeProc'):
-            inf_nfe = root.find('nfe:NFe/nfe:infNFe', ns)
+        
+        # Ajuste para ler XMLs que começam com nfeProc ou direto NFe
+        if 'nfeProc' in root.tag:
+            inf_nfe = root.find('.//nfe:infNFe', ns_map)
         else:
-            inf_nfe = root.find('nfe:infNFe', ns)
+            inf_nfe = root.find('nfe:infNFe', ns_map)
+            
         if inf_nfe is None: return []
 
-        ide = inf_nfe.find('nfe:ide', ns)
-        emit = inf_nfe.find('nfe:emit', ns)
-        dest = inf_nfe.find('nfe:dest', ns)
-        total = inf_nfe.find('nfe:total/nfe:ICMSTot', ns)
+        # Grupos principais
+        ide = inf_nfe.find('nfe:ide', ns_map)
+        emit = inf_nfe.find('nfe:emit', ns_map)
+        dest = inf_nfe.find('nfe:dest', ns_map)
+        total = inf_nfe.find('.//nfe:ICMSTot', ns_map)
         
-        chave = pegar_valor(root.find('nfe:protNFe/nfe:infProt', ns), 'nfe:chNFe')
-        if not chave: chave = inf_nfe.attrib.get('Id', '')[3:]
-        
+        # Identificação da Chave
+        prot = root.find('.//nfe:infProt', ns_map)
+        chave = pegar_valor(prot, 'nfe:chNFe')
+        if not chave: 
+            chave = inf_nfe.attrib.get('Id', '')[3:]
+
+        # Datas
         data_raw = pegar_valor(ide, 'nfe:dhEmi') or pegar_valor(ide, 'nfe:dEmi')
-        data_nfe_dt = datetime.strptime(data_raw[:10], '%Y-%m-%d').date()
-        
-        # Loop itens
+        if len(data_raw) >= 10:
+            data_nfe_dt = datetime.strptime(data_raw[:10], '%Y-%m-%d').date()
+        else:
+            data_nfe_dt = datetime.now().date() # Fallback
+
+        valor_total_nf_float = pegar_valor(total, 'nfe:vNF', float)
+
         itens_db = []
-        dets = inf_nfe.findall('nfe:det', ns)
-        
-        # Colunas completas para o Excel
-        bc_icms_tot = pegar_valor(total, 'nfe:vBC', float)
-        icms_tot = pegar_valor(total, 'nfe:vICMS', float)
-        bc_st_tot = pegar_valor(total, 'nfe:vBCST', float)
-        icms_st_tot = pegar_valor(total, 'nfe:vST', float)
-        desc_tot = pegar_valor(total, 'nfe:vDesc', float)
-        ipi_tot = pegar_valor(total, 'nfe:vIPI', float)
+        dets = inf_nfe.findall('nfe:det', ns_map)
         
         for i, det in enumerate(dets):
-            prod = det.find('nfe:prod', ns)
-            imposto = det.find('nfe:imposto', ns)
+            prod = det.find('nfe:prod', ns_map)
             
-            # (Lógica simplificada de impostos item aqui para economizar espaço, 
-            #  mas assume-se que você quer salvar TUDO no banco)
+            valor_item_float = pegar_valor(prod, 'nfe:vProd', float)
             
-            # Vamos criar um dicionário COMPLETO para salvar no JSON e recuperar depois
+            # --- CRIAÇÃO DO DICIONÁRIO PARA O EXCEL ---
+            # Aqui garantimos que Mês e Ano existam
             item_completo = {
                 'Mês': str(data_nfe_dt.month).zfill(2),
                 'Ano': str(data_nfe_dt.year),
@@ -122,48 +118,48 @@ def extrair_dados_xml(arq):
                 'UF Emitente': pegar_valor(emit, 'nfe:enderEmit/nfe:UF'),
                 'Nr NFe': pegar_valor(ide, 'nfe:nNF'),
                 'Série': pegar_valor(ide, 'nfe:serie'),
-                'Data NFe': str(data_nfe_dt),
-                'BC ICMS Total': bc_icms_tot,
-                'ICMS Total': icms_tot,
-                'BC ST Total': bc_st_tot,
-                'ICMS ST Total': icms_st_tot,
-                'Desc Total': desc_tot,
-                'IPI Total': ipi_tot,
+                'Data NFe': formatar_data(data_nfe_dt),
+                
+                # Valores Monetários
+                'BC ICMS Total': pegar_valor(total, 'nfe:vBC', float),
+                'ICMS Total': pegar_valor(total, 'nfe:vICMS', float),
+                'BC ST Total': pegar_valor(total, 'nfe:vBCST', float),
+                'ICMS ST Total': pegar_valor(total, 'nfe:vST', float),
+                'Desc Total': pegar_valor(total, 'nfe:vDesc', float),
+                'IPI Total': pegar_valor(total, 'nfe:vIPI', float),
                 'Total Produtos': pegar_valor(total, 'nfe:vProd', float),
-                'Total NFe': pegar_valor(total, 'nfe:vNF', float),
+                'Total NFe': valor_total_nf_float,
+                
+                # Dados do Item
                 'Descrição Produto NFe': pegar_valor(prod, 'nfe:xProd'),
                 'NCM na NFe': pegar_valor(prod, 'nfe:NCM'),
                 'CFOP NFe': pegar_valor(prod, 'nfe:CFOP'),
                 'Qtde': pegar_valor(prod, 'nfe:qCom', float),
                 'Unid': pegar_valor(prod, 'nfe:uCom'),
                 'Vr Unit': pegar_valor(prod, 'nfe:vUnCom', float),
-                'Vr Total': pegar_valor(prod, 'nfe:vProd', float),
-                'Desconto Item': pegar_valor(prod, 'nfe:vDesc', float),
-                # ... Adicione os campos de imposto por item aqui se quiser
+                'Vr Total': valor_item_float, # Valor deste item
+                'Desconto Item': pegar_valor(prod, 'nfe:vDesc', float)
             }
             
-            # Objeto para salvar no Banco (SQL)
-            # Usamos chave + indice do item para criar chave unica do item
+            # Objeto Banco de Dados
             nfe_db = NFe(
-                chave=f"{chave}-{i+1}", # Chave composta para guardar cada item
+                chave_item=f"{chave}-{i+1}", # Identificador Único do Item
+                chave_acesso=chave,
                 mes=str(data_nfe_dt.month).zfill(2),
                 ano=str(data_nfe_dt.year),
                 data_emissao=data_nfe_dt,
-                emitente_nome=pegar_valor(emit, 'nfe:xNome'),
-                emitente_cnpj=pegar_valor(emit, 'nfe:CNPJ'),
-                numero_nf=pegar_valor(ide, 'nfe:nNF'),
-                valor_total=pegar_valor(total, 'nfe:vNF', float),
-                produto_nome=pegar_valor(prod, 'nfe:xProd'),
-                dados_json=str(item_completo) # Salvamos o dicionario como texto para recuperar facil
+                valor_total_nota=valor_total_nf_float,
+                valor_item=valor_item_float,
+                dados_json=str(item_completo)
             )
             itens_db.append(nfe_db)
             
         return itens_db
     except Exception as e:
-        print(f"Erro XML {arq}: {e}")
+        print(f"Erro ao processar {arq}: {e}")
         return []
 
-# --- ROTAS ---
+# --- 3. ROTAS E LÓGICA ---
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -177,9 +173,8 @@ async def upload_file(file: UploadFile = File(...)):
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref: zip_ref.extractall(temp_dir)
     except:
-        return JSONResponse({"sucesso": False, "msg": "Erro no ZIP"}, 400)
+        return JSONResponse({"sucesso": False, "msg": "Arquivo inválido (não é ZIP)"}, 400)
     
-    # Processar e Salvar no Banco
     arquivos = glob.glob(f"{temp_dir}/**/*.xml", recursive=True)
     arquivos += glob.glob(f"{temp_dir}/**/*.XML", recursive=True)
     
@@ -189,48 +184,46 @@ async def upload_file(file: UploadFile = File(...)):
         for arq in arquivos:
             itens = extrair_dados_xml(arq)
             for item in itens:
-                session.merge(item) # MERGE = Se existir atualiza, se não insere (Upsert)
+                session.merge(item)
                 contador += 1
         session.commit()
     except Exception as e:
         session.rollback()
-        return JSONResponse({"sucesso": False, "msg": f"Erro banco: {str(e)}"})
+        return JSONResponse({"sucesso": False, "msg": f"Erro interno: {str(e)}"})
     finally:
         session.close()
 
-    return JSONResponse({"sucesso": True, "msg": f"{contador} itens processados e salvos no banco!"})
+    return JSONResponse({"sucesso": True, "msg": f"{contador} itens (produtos) processados!"})
 
 @app.get("/dados-disponiveis")
 async def get_dados():
-    # Retorna quais anos e meses existem no banco para o filtro
     session = SessionLocal()
     try:
-        # Busca anos distintos
         anos = session.query(NFe.ano).distinct().order_by(NFe.ano).all()
-        lista_anos = [a[0] for a in anos]
-        return {"anos": lista_anos}
+        return {"anos": [a[0] for a in anos]}
     finally:
         session.close()
 
-@app.post("/gerar-relatorio")
-async def gerar_relatorio(anos: str = Form(...)):
-    # Recebe "2024,2025" do form
-    lista_anos_filtro = anos.split(',')
-    
+# ROTA 1: Gera o arquivo, salva no disco e retorna a PROVA REAL (JSON)
+@app.post("/processar-relatorio")
+async def processar_relatorio(anos: str = Form(...)):
+    lista_anos = anos.split(',')
     session = SessionLocal()
     try:
-        # Busca no banco filtrando pelos anos
-        resultados = session.query(NFe).filter(NFe.ano.in_(lista_anos_filtro)).all()
+        # Busca dados
+        resultados = session.query(NFe).filter(NFe.ano.in_(lista_anos)).all()
         
+        if not resultados:
+            return JSONResponse({"sucesso": False, "msg": "Nenhum dado encontrado para este período."})
+
         dados_excel = []
         for row in resultados:
-            # Reconverte o texto JSON de volta para dicionario
             d = eval(row.dados_json)
             dados_excel.append(d)
             
         df = pd.DataFrame(dados_excel)
         
-        # Ordenação de Colunas (Garante a sua ordem preferida)
+        # --- DEFINIÇÃO ESTRITA DA ORDEM DAS COLUNAS ---
         colunas_ordem = [
             'Mês', 'Ano', 'Chave Acesso NFe', 'Inscrição Destinatário', 'Inscrição Emitente', 
             'Razão Social Emitente', 'Cnpj Emitente', 'UF Emitente', 'Nr NFe', 'Série', 'Data NFe', 
@@ -239,19 +232,47 @@ async def gerar_relatorio(anos: str = Form(...)):
             'Qtde', 'Unid', 'Vr Unit', 'Vr Total', 'Desconto Item'
         ]
         
-        # Garante colunas
-        if not df.empty:
-            for col in colunas_ordem:
-                if col not in df.columns: df[col] = ""
-            df = df[colunas_ordem]
-            
-        output = "Relatorio_Final.xlsx"
-        df.to_excel(output, index=False)
-        return FileResponse(output, filename="Relatorio_Filtrado.xlsx")
+        # Cria colunas vazias se faltarem e Reordena
+        for col in colunas_ordem:
+            if col not in df.columns: df[col] = ""
+        df = df[colunas_ordem] # AQUI A ORDEM É FORÇADA
         
+        # Salva arquivo localmente
+        output_file = "Relatorio_Final.xlsx"
+        df.to_excel(output_file, index=False)
+        
+        # --- CÁLCULO DA PROVA REAL ---
+        # 1. Soma da coluna 'Vr Total' (Soma de todos os itens/linhas do excel)
+        soma_itens = df['Vr Total'].sum()
+        
+        # 2. Soma da coluna 'Total NFe' (Removendo duplicadas de Nota para não somar o total da nota varias vezes)
+        # Usamos a chave de acesso para identificar notas únicas
+        df_unicas = df.drop_duplicates(subset=['Chave Acesso NFe'])
+        soma_notas = df_unicas['Total NFe'].sum()
+        
+        return JSONResponse({
+            "sucesso": True,
+            "prova_real_itens": f"R$ {soma_itens:,.2f}",
+            "prova_real_notas": f"R$ {soma_notas:,.2f}",
+            "qtd_linhas": len(df),
+            "qtd_notas": len(df_unicas),
+            "download_url": "/baixar-arquivo"
+        })
+        
+    except Exception as e:
+        return JSONResponse({"sucesso": False, "msg": f"Erro ao gerar: {str(e)}"})
     finally:
         session.close()
 
+# ROTA 2: Apenas entrega o arquivo gerado
+@app.get("/baixar-arquivo")
+async def baixar_arquivo():
+    file_path = "Relatorio_Final.xlsx"
+    if os.path.exists(file_path):
+        return FileResponse(file_path, filename="Relatorio_Fiscal_Consolidado.xlsx")
+    return JSONResponse({"msg": "Arquivo não encontrado. Gere novamente."}, 404)
+
+# --- FRONTEND ---
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
@@ -259,140 +280,160 @@ async def home():
     <html lang="pt-br">
     <head>
         <meta charset="UTF-8">
-        <title>Sistema Fiscal 4.0</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+        <title>Extrator Fiscal Pro</title>
+        <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
         <style>
-            body { font-family: 'Inter', sans-serif; background: #f1f5f9; padding: 20px; color: #334155; }
-            .container { max-width: 900px; margin: 0 auto; display: grid; gap: 20px; }
+            body { font-family: 'Roboto', sans-serif; background: #eef2f6; padding: 20px; }
+            .container { max-width: 800px; margin: 0 auto; display: grid; gap: 20px; }
+            .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            h2 { margin-top: 0; color: #1e293b; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
             
-            .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-            h2 { margin-top: 0; color: #0f172a; }
-            
-            /* Area Upload */
-            .drop-zone { border: 2px dashed #cbd5e1; padding: 40px; text-align: center; border-radius: 8px; cursor: pointer; transition: 0.2s; }
+            /* Upload */
+            .drop-zone { border: 2px dashed #94a3b8; padding: 30px; text-align: center; border-radius: 8px; cursor: pointer; background: #f8fafc; }
             .drop-zone:hover { border-color: #3b82f6; background: #eff6ff; }
             
-            /* Area Filtros */
-            .filters { margin-top: 20px; padding: 20px; background: #f8fafc; border-radius: 8px; }
-            .checkbox-group { display: flex; gap: 15px; flex-wrap: wrap; margin: 10px 0; }
-            .checkbox-label { background: white; padding: 8px 16px; border: 1px solid #e2e8f0; border-radius: 20px; cursor: pointer; user-select: none; }
-            .checkbox-label:has(input:checked) { background: #3b82f6; color: white; border-color: #3b82f6; }
+            /* Filtros */
+            .checkbox-group { display: flex; gap: 10px; margin: 15px 0; flex-wrap: wrap; }
+            .tag-check { cursor: pointer; background: #f1f5f9; padding: 8px 15px; border-radius: 20px; border: 1px solid #cbd5e1; transition: 0.2s; }
+            .tag-check:has(input:checked) { background: #3b82f6; color: white; border-color: #3b82f6; }
             input[type="checkbox"] { display: none; }
             
-            .btn { background: #3b82f6; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; cursor: pointer; width: 100%; font-size: 16px; }
-            .btn:disabled { background: #cbd5e1; }
-            .btn-green { background: #10b981; }
-            .btn-green:hover { background: #059669; }
+            /* Botão e Status */
+            .btn { width: 100%; padding: 15px; background: #3b82f6; color: white; border: none; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; }
+            .btn:disabled { background: #cbd5e1; cursor: not-allowed; }
+            .btn:hover:not(:disabled) { background: #2563eb; }
             
-            .status { margin-top: 10px; font-weight: 600; text-align: center; }
+            /* Prova Real Box */
+            #resultBox { display: none; background: #dcfce7; border: 1px solid #86efac; padding: 20px; border-radius: 8px; margin-top: 20px; }
+            .resumo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 10px; }
+            .resumo-item { background: white; padding: 10px; border-radius: 6px; text-align: center; }
+            .resumo-label { font-size: 0.85em; color: #64748b; }
+            .resumo-val { font-size: 1.2em; font-weight: bold; color: #059669; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="card">
-                <h2>📂 1. Importar XMLs</h2>
-                <p>Suba quantos arquivos ZIP quiser. O banco guarda tudo e remove duplicados.</p>
-                <form id="uploadForm">
-                    <div class="drop-zone" id="dropZone">
-                        <span style="font-size: 30px">☁️</span><br>
-                        Arraste ZIPs aqui
-                        <input type="file" id="fileInput" accept=".zip" style="display:none">
-                    </div>
-                </form>
-                <div id="uploadStatus" class="status"></div>
+                <h2>1. Importar XMLs</h2>
+                <div class="drop-zone" id="dropZone">
+                    📂 Clique ou arraste o arquivo ZIP aqui
+                    <input type="file" id="fileInput" accept=".zip" style="display:none">
+                </div>
+                <div id="uploadStatus" style="margin-top:10px; text-align:center; font-weight:bold;"></div>
             </div>
 
             <div class="card">
-                <h2>📊 2. Gerar Relatório</h2>
-                <p>Selecione os anos que deseja incluir no Excel final:</p>
+                <h2>2. Gerar Relatório e Prova Real</h2>
+                <p>Selecione os anos:</p>
+                <div class="checkbox-group" id="yearsContainer">Carregando...</div>
                 
-                <div id="loadingYears">Carregando dados do banco...</div>
+                <button class="btn" id="btnGerar" onclick="gerarRelatorio()" disabled>Processar Relatório</button>
                 
-                <form id="reportForm" action="/gerar-relatorio" method="post">
-                    <div class="checkbox-group" id="yearsContainer">
+                <div id="resultBox">
+                    <h3 style="margin:0; color:#166534">✅ Relatório Gerado com Sucesso!</h3>
+                    <p>O download iniciará automaticamente.</p>
+                    <div class="resumo-grid">
+                        <div class="resumo-item">
+                            <div class="resumo-label">Total das Notas (Cabeçalho)</div>
+                            <div class="resumo-val" id="valNotas">R$ 0,00</div>
+                            <small id="qtdNotas">0 notas</small>
                         </div>
-                    <input type="hidden" name="anos" id="anosInput">
-                    <button type="submit" class="btn btn-green" id="btnReport" disabled>Baixar Excel Consolidado</button>
-                </form>
+                        <div class="resumo-item">
+                            <div class="resumo-label">Soma dos Itens (Produtos)</div>
+                            <div class="resumo-val" id="valItens">R$ 0,00</div>
+                            <small id="qtdLinhas">0 linhas</small>
+                        </div>
+                    </div>
+                    <a href="#" id="downloadLink" style="display:block; text-align:center; margin-top:15px; color:#166534">Caso não baixe, clique aqui</a>
+                </div>
             </div>
         </div>
 
         <script>
-            // --- LÓGICA DE UPLOAD ---
+            // --- UPLOAD ---
             const dropZone = document.getElementById('dropZone');
             const fileInput = document.getElementById('fileInput');
+            dropZone.onclick = () => fileInput.click();
+            fileInput.onchange = () => handleUpload(fileInput.files[0]);
             
-            dropZone.addEventListener('click', () => fileInput.click());
-            dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.borderColor = '#3b82f6'; });
-            dropZone.addEventListener('dragleave', () => dropZone.style.borderColor = '#cbd5e1');
-            dropZone.addEventListener('drop', (e) => {
-                e.preventDefault();
-                if(e.dataTransfer.files.length) handleUpload(e.dataTransfer.files[0]);
-            });
-            fileInput.addEventListener('change', () => { if(fileInput.files.length) handleUpload(fileInput.files[0]); });
+            dropZone.ondragover = (e) => { e.preventDefault(); dropZone.style.background = '#eff6ff'; };
+            dropZone.ondragleave = () => dropZone.style.background = '#f8fafc';
+            dropZone.ondrop = (e) => { e.preventDefault(); handleUpload(e.dataTransfer.files[0]); };
 
             async function handleUpload(file) {
-                const status = document.getElementById('uploadStatus');
-                status.textContent = "Enviando e processando no Banco de Dados...";
-                status.style.color = "blue";
+                if(!file) return;
+                const fd = new FormData(); fd.append("file", file);
+                document.getElementById('uploadStatus').innerText = "Enviando...";
                 
-                const formData = new FormData();
-                formData.append("file", file);
+                const res = await fetch('/upload', { method: 'POST', body: fd });
+                const data = await res.json();
+                document.getElementById('uploadStatus').innerText = data.msg;
+                document.getElementById('uploadStatus').style.color = data.sucesso ? "green" : "red";
+                loadYears();
+            }
+
+            // --- FILTROS ---
+            async function loadYears() {
+                const res = await fetch('/dados-disponiveis');
+                const data = await res.json();
+                const div = document.getElementById('yearsContainer');
+                div.innerHTML = "";
+                data.anos.forEach(ano => {
+                    div.innerHTML += `<label class="tag-check"><input type="checkbox" value="${ano}" onchange="checkBtn()"> ${ano}</label>`;
+                });
+                if(data.anos.length === 0) div.innerHTML = "Nenhum dado importado.";
+            }
+
+            function checkBtn() {
+                const check = document.querySelectorAll('input[type="checkbox"]:checked');
+                document.getElementById('btnGerar').disabled = check.length === 0;
+            }
+
+            // --- GERAR RELATORIO E PROVA REAL ---
+            async function gerarRelatorio() {
+                const btn = document.getElementById('btnGerar');
+                const box = document.getElementById('resultBox');
+                const checked = document.querySelectorAll('input[type="checkbox"]:checked');
+                const anos = Array.from(checked).map(c => c.value).join(',');
                 
+                btn.disabled = true;
+                btn.innerText = "Calculando...";
+                box.style.display = 'none';
+
+                const fd = new FormData();
+                fd.append('anos', anos);
+
                 try {
-                    const res = await fetch('/upload', { method: 'POST', body: formData });
+                    const res = await fetch('/processar-relatorio', { method: 'POST', body: fd });
                     const data = await res.json();
                     
                     if(data.sucesso) {
-                        status.textContent = "✅ " + data.msg;
-                        status.style.color = "green";
-                        loadYears(); // Recarrega os filtros
+                        // Preenche a Prova Real
+                        document.getElementById('valNotas').innerText = data.prova_real_notas;
+                        document.getElementById('qtdNotas').innerText = data.qtd_notas + " notas unicas";
+                        
+                        document.getElementById('valItens').innerText = data.prova_real_itens;
+                        document.getElementById('qtdLinhas').innerText = data.qtd_linhas + " linhas";
+                        
+                        // Link Manual
+                        document.getElementById('downloadLink').href = data.download_url;
+                        
+                        // Mostra Box
+                        box.style.display = 'block';
+                        
+                        // Download Automatico
+                        window.location.href = data.download_url;
                     } else {
-                        status.textContent = "❌ " + data.msg;
-                        status.style.color = "red";
+                        alert("Erro: " + data.msg);
                     }
                 } catch(e) {
-                    status.textContent = "Erro de conexão.";
-                    status.style.color = "red";
+                    alert("Erro de comunicação.");
                 }
-            }
-
-            // --- LÓGICA DE FILTROS ---
-            async function loadYears() {
-                try {
-                    const res = await fetch('/dados-disponiveis');
-                    const data = await res.json();
-                    
-                    const container = document.getElementById('yearsContainer');
-                    document.getElementById('loadingYears').style.display = 'none';
-                    container.innerHTML = '';
-                    
-                    if(data.anos.length === 0) {
-                        container.innerHTML = "Nenhum dado no banco ainda.";
-                        return;
-                    }
-
-                    data.anos.forEach(ano => {
-                        const label = document.createElement('label');
-                        label.className = 'checkbox-label';
-                        label.innerHTML = `<input type="checkbox" value="${ano}" onchange="checkBtn()"> ${ano}`;
-                        container.appendChild(label);
-                    });
-                } catch(e) { console.log(e); }
-            }
-
-            // Ativa botão se tiver algo marcado
-            window.checkBtn = function() {
-                const checked = document.querySelectorAll('input[type="checkbox"]:checked');
-                const btn = document.getElementById('btnReport');
-                btn.disabled = checked.length === 0;
                 
-                // Prepara input hidden para envio
-                const vals = Array.from(checked).map(c => c.value).join(',');
-                document.getElementById('anosInput').value = vals;
+                btn.disabled = false;
+                btn.innerText = "Processar Relatório";
             }
-
-            // Carrega filtros ao abrir
+            
             loadYears();
         </script>
     </body>
