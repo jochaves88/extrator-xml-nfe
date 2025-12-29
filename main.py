@@ -6,196 +6,147 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from sqlalchemy import create_engine, Column, String, Float, Date, Integer
+from sqlalchemy import create_engine, Column, String, Float, Date
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 
 app = FastAPI()
 
-# --- 1. BANCO DE DADOS ---
+# --- BANCO DE DADOS ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 class NFe(Base):
-    # MUDEI O NOME DA TABELA PARA IGNORAR DADOS VELHOS QUE ESTAVAM DANDO ERRO
-    __tablename__ = "notas_fiscais_v2" 
-    
-    chave_item = Column(String, primary_key=True, index=True) # ID Único (Chave + Numero Item)
+    __tablename__ = "notas_fiscais_v3"  # V3 para garantir tabela limpa
+    chave_item = Column(String, primary_key=True, index=True)
     chave_acesso = Column(String)
     ano = Column(String)
-    valor_total_nota = Column(Float)
-    valor_item = Column(Float)
-    dados_json = Column(String) # Guarda todos os dados para o Excel
+    dados_json = Column(String)
 
-# Cria a tabela nova
 Base.metadata.create_all(bind=engine)
 
-# --- 2. FUNÇÕES ÚTEIS ---
+# --- FUNÇÕES XML ---
 ns_map = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
-def pegar_valor(no, caminho, tipo=str):
-    if no is None: return tipo(0) if tipo in [float, int] else ""
+def get_val(node, path, type_fn=str):
+    if node is None: return type_fn(0) if type_fn in [float, int] else ""
     try:
-        # Tenta achar com namespace
-        r = no.find(caminho, ns_map)
-        # Se falhar, tenta sem namespace (alguns XMLs variam)
-        if r is None: r = no.find(caminho.replace('nfe:', ''))
-        
+        r = node.find(path, ns_map)
+        if r is None: r = node.find(path.replace('nfe:', ''))
         if r is not None and r.text:
-            val = r.text.replace(',', '.')
-            return tipo(val)
-        return tipo(0) if tipo in [float, int] else ""
-    except:
-        return tipo(0) if tipo in [float, int] else ""
+            return type_fn(r.text.replace(',', '.'))
+    except: pass
+    return type_fn(0) if type_fn in [float, int] else ""
 
-def formatar_data(data_obj):
-    if not data_obj: return ""
-    return data_obj.strftime('%d/%m/%Y')
-
-def extrair_dados_xml(arq):
+def parse_xml(filepath):
     try:
-        tree = ET.parse(arq)
+        tree = ET.parse(filepath)
         root = tree.getroot()
+        if 'nfeProc' in root.tag: inf = root.find('.//nfe:infNFe', ns_map)
+        else: inf = root.find('nfe:infNFe', ns_map)
+        if inf is None: return []
+
+        ide = inf.find('nfe:ide', ns_map)
+        emit = inf.find('nfe:emit', ns_map)
+        dest = inf.find('nfe:dest', ns_map)
+        total = inf.find('.//nfe:ICMSTot', ns_map)
         
-        # Localiza o infNFe
-        if 'nfeProc' in root.tag:
-            inf_nfe = root.find('.//nfe:infNFe', ns_map)
-        else:
-            inf_nfe = root.find('nfe:infNFe', ns_map)
-            
-        if inf_nfe is None: return []
-
-        # Blocos principais
-        ide = inf_nfe.find('nfe:ide', ns_map)
-        emit = inf_nfe.find('nfe:emit', ns_map)
-        dest = inf_nfe.find('nfe:dest', ns_map)
-        total = inf_nfe.find('.//nfe:ICMSTot', ns_map)
+        prot = root.find('.//nfe:infProt', ns_map)
+        chave = get_val(prot, 'nfe:chNFe') or inf.attrib.get('Id', '')[3:]
         
-        # Chave e Data
-        chave = pegar_valor(root.find('.//nfe:infProt', ns_map), 'nfe:chNFe')
-        if not chave: chave = inf_nfe.attrib.get('Id', '')[3:]
+        dt_str = get_val(ide, 'nfe:dhEmi') or get_val(ide, 'nfe:dEmi')
+        dt = datetime.now()
+        if len(dt_str) >= 10: dt = datetime.strptime(dt_str[:10], '%Y-%m-%d')
 
-        data_raw = pegar_valor(ide, 'nfe:dhEmi') or pegar_valor(ide, 'nfe:dEmi')
-        data_dt = datetime.now().date()
-        if len(data_raw) >= 10:
-            data_dt = datetime.strptime(data_raw[:10], '%Y-%m-%d').date()
-
-        v_nf = pegar_valor(total, 'nfe:vNF', float)
-
-        # Loop nos Itens
+        v_nf = get_val(total, 'nfe:vNF', float)
         itens_db = []
-        dets = inf_nfe.findall('nfe:det', ns_map)
         
-        for i, det in enumerate(dets):
+        for i, det in enumerate(inf.findall('nfe:det', ns_map)):
             prod = det.find('nfe:prod', ns_map)
-            v_prod = pegar_valor(prod, 'nfe:vProd', float)
+            v_prod = get_val(prod, 'nfe:vProd', float)
             
-            # MONTAGEM DO EXCEL (DICIONARIO)
-            item_dict = {
-                'Mês': str(data_dt.month).zfill(2),
-                'Ano': str(data_dt.year),
+            row = {
+                'Mês': str(dt.month).zfill(2),
+                'Ano': str(dt.year),
                 'Chave Acesso NFe': chave,
-                'Inscrição Destinatário': pegar_valor(dest, 'nfe:IE'),
-                'Inscrição Emitente': pegar_valor(emit, 'nfe:IE'),
-                'Razão Social Emitente': pegar_valor(emit, 'nfe:xNome'),
-                'Cnpj Emitente': pegar_valor(emit, 'nfe:CNPJ'),
-                'UF Emitente': pegar_valor(emit, 'nfe:enderEmit/nfe:UF'),
-                'Nr NFe': pegar_valor(ide, 'nfe:nNF'),
-                'Série': pegar_valor(ide, 'nfe:serie'),
-                'Data NFe': formatar_data(data_dt),
-                'BC ICMS Total': pegar_valor(total, 'nfe:vBC', float),
-                'ICMS Total': pegar_valor(total, 'nfe:vICMS', float),
-                'BC ST Total': pegar_valor(total, 'nfe:vBCST', float),
-                'ICMS ST Total': pegar_valor(total, 'nfe:vST', float),
-                'Desc Total': pegar_valor(total, 'nfe:vDesc', float),
-                'IPI Total': pegar_valor(total, 'nfe:vIPI', float),
-                'Total Produtos': pegar_valor(total, 'nfe:vProd', float),
+                'Inscrição Destinatário': get_val(dest, 'nfe:IE'),
+                'Inscrição Emitente': get_val(emit, 'nfe:IE'),
+                'Razão Social Emitente': get_val(emit, 'nfe:xNome'),
+                'Cnpj Emitente': get_val(emit, 'nfe:CNPJ'),
+                'UF Emitente': get_val(emit, 'nfe:enderEmit/nfe:UF'),
+                'Nr NFe': get_val(ide, 'nfe:nNF'),
+                'Série': get_val(ide, 'nfe:serie'),
+                'Data NFe': dt.strftime('%d/%m/%Y'),
+                'BC ICMS Total': get_val(total, 'nfe:vBC', float),
+                'ICMS Total': get_val(total, 'nfe:vICMS', float),
+                'BC ST Total': get_val(total, 'nfe:vBCST', float),
+                'ICMS ST Total': get_val(total, 'nfe:vST', float),
+                'Desc Total': get_val(total, 'nfe:vDesc', float),
+                'IPI Total': get_val(total, 'nfe:vIPI', float),
+                'Total Produtos': get_val(total, 'nfe:vProd', float),
                 'Total NFe': v_nf,
-                'Descrição Produto NFe': pegar_valor(prod, 'nfe:xProd'),
-                'NCM na NFe': pegar_valor(prod, 'nfe:NCM'),
-                'CFOP NFe': pegar_valor(prod, 'nfe:CFOP'),
-                'Qtde': pegar_valor(prod, 'nfe:qCom', float),
-                'Unid': pegar_valor(prod, 'nfe:uCom'),
-                'Vr Unit': pegar_valor(prod, 'nfe:vUnCom', float),
+                'Descrição Produto NFe': get_val(prod, 'nfe:xProd'),
+                'NCM na NFe': get_val(prod, 'nfe:NCM'),
+                'CFOP NFe': get_val(prod, 'nfe:CFOP'),
+                'Qtde': get_val(prod, 'nfe:qCom', float),
+                'Unid': get_val(prod, 'nfe:uCom'),
+                'Vr Unit': get_val(prod, 'nfe:vUnCom', float),
                 'Vr Total': v_prod,
-                'Desconto Item': pegar_valor(prod, 'nfe:vDesc', float)
+                'Desconto Item': get_val(prod, 'nfe:vDesc', float)
             }
-            
-            # Objeto para salvar no Banco
-            novo_obj = NFe(
-                chave_item=f"{chave}-{i+1}", # Chave Única composta
-                chave_acesso=chave,
-                ano=str(data_dt.year),
-                valor_total_nota=v_nf,
-                valor_item=v_prod,
-                dados_json=str(item_dict)
-            )
-            itens_db.append(novo_obj)
-            
+            itens_db.append(NFe(
+                chave_item=f"{chave}-{i}", 
+                chave_acesso=chave, 
+                ano=str(dt.year), 
+                dados_json=str(row)
+            ))
         return itens_db
+    except: return []
 
-    except Exception as e:
-        print(f"Erro XML: {e}")
-        return []
-
-# --- 3. ROTAS ---
-
+# --- ROTAS ---
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    temp_dir = "temp_files"
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir)
-    
-    caminho_zip = os.path.join(temp_dir, "temp.zip")
-    with open(caminho_zip, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
-    
+async def upload(file: UploadFile = File(...)):
+    tmp = "temp_files"
+    if os.path.exists(tmp): shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    path = os.path.join(tmp, "upload.zip")
+    with open(path, "wb") as b: shutil.copyfileobj(file.file, b)
     try:
-        with zipfile.ZipFile(caminho_zip, 'r') as z: z.extractall(temp_dir)
-    except:
-        return JSONResponse({"sucesso": False, "msg": "Erro: Arquivo não é ZIP"}, 400)
+        with zipfile.ZipFile(path, 'r') as z: z.extractall(tmp)
+    except: return JSONResponse({"ok": False, "msg": "Arquivo inválido (use ZIP)"})
     
-    arquivos = glob.glob(f"{temp_dir}/**/*.xml", recursive=True)
-    arquivos += glob.glob(f"{temp_dir}/**/*.XML", recursive=True)
-    
-    session = SessionLocal()
-    cont = 0
+    sess = SessionLocal()
+    c = 0
     try:
-        for f in arquivos:
-            itens = extrair_dados_xml(f)
-            for it in itens:
-                session.merge(it)
-                cont += 1
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        return JSONResponse({"sucesso": False, "msg": f"Erro Banco: {str(e)}"})
-    finally:
-        session.close()
-        
-    return JSONResponse({"sucesso": True, "msg": f"{cont} itens processados!"})
+        for f in glob.glob(f"{tmp}/**/*.[xX][mM][lL]", recursive=True):
+            for item in parse_xml(f):
+                sess.merge(item)
+                c += 1
+        sess.commit()
+    except Exception as e: return JSONResponse({"ok": False, "msg": str(e)})
+    finally: sess.close()
+    return JSONResponse({"ok": True, "msg": f"{c} itens processados."})
 
-@app.get("/dados-disponiveis")
-async def get_dados():
-    session = SessionLocal()
-    anos = session.query(NFe.ano).distinct().order_by(NFe.ano).all()
-    session.close()
-    return {"anos": [a[0] for a in anos]}
+@app.get("/anos")
+async def anos():
+    s = SessionLocal()
+    a = s.query(NFe.ano).distinct().order_by(NFe.ano).all()
+    s.close()
+    return {"anos": [x[0] for x in a]}
 
-@app.post("/processar-relatorio")
-async def processar(anos: str = Form(...)):
-    l_anos = anos.split(',')
-    session = SessionLocal()
+@app.post("/relatorio")
+async def relatorio(anos: str = Form(...)):
+    s = SessionLocal()
     try:
-        res = session.query(NFe).filter(NFe.ano.in_(l_anos)).all()
-        if not res: return JSONResponse({"sucesso": False, "msg": "Sem dados"})
+        res = s.query(NFe).filter(NFe.ano.in_(anos.split(','))).all()
+        if not res: return JSONResponse({"ok": False, "msg": "Sem dados"})
         
-        lista_dicts = [eval(row.dados_json) for row in res]
-        df = pd.DataFrame(lista_dicts)
+        df = pd.DataFrame([eval(r.dados_json) for r in res])
         
-        # ORDEM DAS COLUNAS OBRIGATÓRIA
+        # --- ORDEM BLINDADA ---
         cols = [
             'Mês', 'Ano', 'Chave Acesso NFe', 'Inscrição Destinatário', 'Inscrição Emitente', 
             'Razão Social Emitente', 'Cnpj Emitente', 'UF Emitente', 'Nr NFe', 'Série', 'Data NFe', 
@@ -203,121 +154,219 @@ async def processar(anos: str = Form(...)):
             'Total Produtos', 'Total NFe', 'Descrição Produto NFe', 'NCM na NFe', 'CFOP NFe', 
             'Qtde', 'Unid', 'Vr Unit', 'Vr Total', 'Desconto Item'
         ]
+        # Reindex força a criação das colunas na ordem exata e preenche NaN com ""
+        df = df.reindex(columns=cols).fillna("")
         
-        # Garante que as colunas existam
-        for c in cols:
-            if c not in df.columns: df[c] = ""
-        df = df[cols]
+        out = "Relatorio.xlsx"
+        df.to_excel(out, index=False)
         
-        df.to_excel("Relatorio_Final.xlsx", index=False)
-        
-        # PROVA REAL
-        soma_itens = df['Vr Total'].sum()
-        df_unicas = df.drop_duplicates(subset=['Chave Acesso NFe'])
-        soma_notas = df_unicas['Total NFe'].sum()
+        # Prova Real
+        v_itens = df['Vr Total'].sum()
+        v_notas = df.drop_duplicates('Chave Acesso NFe')['Total NFe'].sum()
         
         return JSONResponse({
-            "sucesso": True,
-            "prova_real_notas": f"R$ {soma_notas:,.2f}",
-            "prova_real_itens": f"R$ {soma_itens:,.2f}",
-            "qtd_notas": len(df_unicas),
+            "ok": True,
+            "notas": f"R$ {v_notas:,.2f}",
+            "itens": f"R$ {v_itens:,.2f}",
+            "qtd_notas": len(df.drop_duplicates('Chave Acesso NFe')),
             "qtd_linhas": len(df),
-            "download_url": "/baixar"
+            "url": "/download"
         })
-    except Exception as e:
-        return JSONResponse({"sucesso": False, "msg": str(e)})
-    finally:
-        session.close()
+    finally: s.close()
 
-@app.get("/baixar")
-async def baixar():
-    return FileResponse("Relatorio_Final.xlsx", filename="Relatorio_Consolidado.xlsx")
+@app.get("/download")
+async def down(): return FileResponse("Relatorio.xlsx", filename="Relatorio_Final.xlsx")
 
-# --- FRONTEND ---
+# --- FRONTEND MODERNO (Tailwind + SweetAlert) ---
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
     <!DOCTYPE html>
-    <html>
+    <html lang="pt-br">
     <head>
         <meta charset="UTF-8">
         <title>Extrator Fiscal</title>
-        <style>
-            body{font-family:sans-serif; background:#f0f2f5; padding:20px;}
-            .box{background:white; padding:20px; border-radius:8px; max-width:600px; margin:0 auto 20px; box-shadow:0 2px 5px rgba(0,0,0,0.1);}
-            .btn{background:#2563eb; color:white; padding:10px 20px; border:none; border-radius:4px; cursor:pointer; font-size:16px; width:100%;}
-            .btn:disabled{background:#ccc;}
-            .resumo{background:#dcfce7; padding:15px; border-radius:6px; margin-top:15px; display:none; border:1px solid #22c55e;}
-            .val{font-size:20px; font-weight:bold; color:#15803d;}
-            .drop{border:2px dashed #ccc; padding:30px; text-align:center; cursor:pointer;}
-            .drop:hover{border-color:#2563eb; background:#eff6ff;}
-        </style>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     </head>
-    <body>
-        <div class="box">
-            <h2>1. Upload ZIP</h2>
-            <div class="drop" onclick="document.getElementById('file').click()">
-                Clique para selecionar ZIP
-                <input type="file" id="file" accept=".zip" hidden onchange="upload(this.files[0])">
-            </div>
-            <p id="status" style="text-align:center"></p>
-        </div>
-
-        <div class="box">
-            <h2>2. Relatório</h2>
-            <div id="checks">Carregando anos...</div>
-            <br>
-            <button class="btn" id="btnGerar" onclick="gerar()" disabled>Processar</button>
+    <body class="bg-slate-100 font-sans text-slate-800">
+        <div class="max-w-4xl mx-auto p-6 space-y-8">
             
-            <div id="resumo" class="resumo">
-                <h3>✅ Sucesso!</h3>
-                <p>Total Notas: <span id="rNotas" class="val"></span></p>
-                <p>Total Itens: <span id="rItens" class="val"></span></p>
-                <a href="" id="linkDown">Baixar Arquivo</a>
+            <div class="text-center">
+                <h1 class="text-3xl font-bold text-blue-600 mb-2"><i class="fas fa-file-invoice-dollar"></i> Extrator XML Pro</h1>
+                <p class="text-slate-500">Importe suas notas e gere relatórios consolidados</p>
             </div>
+
+            <div class="bg-white p-8 rounded-xl shadow-sm border border-slate-200">
+                <h2 class="text-xl font-semibold mb-4 text-slate-700">1. Importação</h2>
+                
+                <div id="dropZone" class="border-4 border-dashed border-blue-200 rounded-xl p-10 text-center cursor-pointer hover:bg-blue-50 hover:border-blue-400 transition-all group">
+                    <i class="fas fa-cloud-upload-alt text-5xl text-blue-300 group-hover:text-blue-500 mb-4"></i>
+                    <p class="text-lg font-medium text-slate-600">Arraste seu arquivo ZIP aqui</p>
+                    <p class="text-sm text-slate-400 mt-2">ou clique para selecionar</p>
+                    <input type="file" id="fileInput" accept=".zip" class="hidden">
+                </div>
+                <div id="status" class="mt-4 text-center text-sm font-semibold h-6"></div>
+            </div>
+
+            <div class="bg-white p-8 rounded-xl shadow-sm border border-slate-200">
+                <h2 class="text-xl font-semibold mb-4 text-slate-700">2. Relatório</h2>
+                
+                <div class="mb-4">
+                    <p class="mb-2 text-sm text-slate-500 font-bold uppercase">Anos Disponíveis:</p>
+                    <div id="yearsDiv" class="flex flex-wrap gap-3">
+                        <span class="text-slate-400 italic">Carregando...</span>
+                    </div>
+                </div>
+
+                <button id="btnGen" onclick="gerar()" disabled 
+                    class="w-full py-4 bg-slate-300 text-white font-bold rounded-lg shadow-sm cursor-not-allowed transition-all">
+                    Selecione um ano para gerar
+                </button>
+            </div>
+
         </div>
 
         <script>
-            async function upload(f){
-                if(!f) return;
-                let fd = new FormData(); fd.append('file', f);
-                document.getElementById('status').innerText = "Enviando...";
-                let res = await fetch('/upload', {method:'POST', body:fd});
-                let d = await res.json();
-                document.getElementById('status').innerText = d.msg;
-                loadAnos();
-            }
-            async function loadAnos(){
-                let res = await fetch('/dados-disponiveis');
-                let d = await res.json();
-                let h = '';
-                d.anos.forEach(a => h += `<label style="margin-right:10px"><input type="checkbox" value="${a}" onchange="check()"> ${a}</label>`);
-                document.getElementById('checks').innerHTML = h || 'Sem dados.';
-            }
-            function check(){
-                document.getElementById('btnGerar').disabled = !document.querySelector('input:checked');
-            }
-            async function gerar(){
-                let btn = document.getElementById('btnGerar');
-                btn.disabled = true; btn.innerText = "Processando...";
-                let anos = Array.from(document.querySelectorAll('input:checked')).map(x=>x.value).join(',');
-                let fd = new FormData(); fd.append('anos', anos);
+            // --- DRAG AND DROP CORRIGIDO ---
+            const dropZone = document.getElementById('dropZone');
+            const fileInput = document.getElementById('fileInput');
+            const status = document.getElementById('status');
+
+            // Previne o navegador de abrir o arquivo
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
+                dropZone.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); });
+            });
+
+            dropZone.addEventListener('dragover', () => dropZone.classList.add('bg-blue-50', 'border-blue-400'));
+            dropZone.addEventListener('dragleave', () => dropZone.classList.remove('bg-blue-50', 'border-blue-400'));
+            
+            dropZone.addEventListener('drop', e => {
+                dropZone.classList.remove('bg-blue-50', 'border-blue-400');
+                if(e.dataTransfer.files.length) upload(e.dataTransfer.files[0]);
+            });
+
+            dropZone.addEventListener('click', () => fileInput.click());
+            fileInput.addEventListener('change', () => { if(fileInput.files.length) upload(fileInput.files[0]); });
+
+            async function upload(file) {
+                if(file.type.indexOf('zip') === -1 && !file.name.endsWith('.zip')) {
+                    Swal.fire('Erro', 'Por favor envie apenas arquivos .ZIP', 'error');
+                    return;
+                }
+                
+                status.innerHTML = '<span class="text-blue-600"><i class="fas fa-spinner fa-spin"></i> Enviando e processando...</span>';
+                const fd = new FormData(); fd.append('file', file);
                 
                 try {
-                    let res = await fetch('/processar-relatorio', {method:'POST', body:fd});
-                    let d = await res.json();
-                    if(d.sucesso){
-                        document.getElementById('rNotas').innerText = d.prova_real_notas + " (" + d.qtd_notas + " docs)";
-                        document.getElementById('rItens').innerText = d.prova_real_itens + " (" + d.qtd_linhas + " linhas)";
-                        document.getElementById('linkDown').href = d.download_url;
-                        document.getElementById('resumo').style.display = 'block';
-                        window.location.href = d.download_url;
-                    } else { alert(d.msg); }
-                } catch(e){ alert("Erro ao processar"); }
-                
-                btn.disabled = false; btn.innerText = "Processar";
+                    const res = await fetch('/upload', { method: 'POST', body: fd });
+                    const data = await res.json();
+                    
+                    if(data.ok) {
+                        status.innerHTML = `<span class="text-green-600"><i class="fas fa-check"></i> ${data.msg}</span>`;
+                        loadYears();
+                        Swal.fire('Sucesso!', data.msg, 'success');
+                    } else { throw new Error(data.msg); }
+                } catch(e) {
+                    status.innerHTML = '<span class="text-red-500">Erro no envio.</span>';
+                    Swal.fire('Erro', e.message, 'error');
+                }
             }
-            loadAnos();
+
+            // --- FILTROS ---
+            async function loadYears() {
+                const res = await fetch('/anos');
+                const data = await res.json();
+                const div = document.getElementById('yearsDiv');
+                div.innerHTML = '';
+                
+                if(data.anos.length === 0) {
+                    div.innerHTML = '<span class="text-slate-400">Nenhum dado encontrado.</span>';
+                    return;
+                }
+
+                data.anos.forEach(ano => {
+                    div.innerHTML += `
+                        <label class="cursor-pointer">
+                            <input type="checkbox" value="${ano}" onchange="checkBtn()" class="peer sr-only">
+                            <span class="px-4 py-2 bg-slate-100 border border-slate-300 rounded-full text-slate-600 peer-checked:bg-blue-600 peer-checked:text-white peer-checked:border-blue-600 transition-all hover:bg-slate-200 select-none">
+                                ${ano}
+                            </span>
+                        </label>
+                    `;
+                });
+            }
+
+            function checkBtn() {
+                const hasChecked = document.querySelectorAll('input[type="checkbox"]:checked').length > 0;
+                const btn = document.getElementById('btnGen');
+                if(hasChecked) {
+                    btn.disabled = false;
+                    btn.classList.remove('bg-slate-300', 'cursor-not-allowed');
+                    btn.classList.add('bg-blue-600', 'hover:bg-blue-700', 'shadow-md');
+                    btn.innerText = "Gerar Relatório e Ver Prova Real";
+                } else {
+                    btn.disabled = true;
+                    btn.classList.add('bg-slate-300', 'cursor-not-allowed');
+                    btn.classList.remove('bg-blue-600', 'hover:bg-blue-700', 'shadow-md');
+                    btn.innerText = "Selecione um ano para gerar";
+                }
+            }
+
+            // --- GERAÇÃO ---
+            async function gerar() {
+                const btn = document.getElementById('btnGen');
+                const anos = Array.from(document.querySelectorAll('input:checked')).map(x => x.value).join(',');
+                
+                btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Processando...';
+                
+                const fd = new FormData(); fd.append('anos', anos);
+                
+                try {
+                    const res = await fetch('/relatorio', { method: 'POST', body: fd });
+                    const data = await res.json();
+                    
+                    if(data.ok) {
+                        // SWEET ALERT COM A PROVA REAL
+                        Swal.fire({
+                            title: '<strong>Relatório Gerado!</strong>',
+                            icon: 'success',
+                            html: `
+                                <div class="grid grid-cols-2 gap-4 text-left bg-slate-50 p-4 rounded-lg border border-slate-200">
+                                    <div>
+                                        <div class="text-xs text-slate-500 uppercase font-bold">Total NFe</div>
+                                        <div class="text-lg text-green-700 font-bold">${data.notas}</div>
+                                        <div class="text-xs text-slate-400">${data.qtd_notas} notas</div>
+                                    </div>
+                                    <div>
+                                        <div class="text-xs text-slate-500 uppercase font-bold">Total Produtos</div>
+                                        <div class="text-lg text-green-700 font-bold">${data.itens}</div>
+                                        <div class="text-xs text-slate-400">${data.qtd_linhas} itens</div>
+                                    </div>
+                                </div>
+                            `,
+                            showCancelButton: true,
+                            confirmButtonText: '<i class="fas fa-download"></i> Baixar Excel',
+                            cancelButtonText: 'Fechar',
+                            confirmButtonColor: '#16a34a'
+                        }).then((result) => {
+                            if (result.isConfirmed) {
+                                window.location.href = data.url;
+                            }
+                        });
+                    } else {
+                        Swal.fire('Atenção', data.msg, 'warning');
+                    }
+                } catch(e) {
+                    Swal.fire('Erro', 'Falha na comunicação com o servidor.', 'error');
+                }
+                
+                checkBtn(); // Reseta botão
+            }
+            
+            // Inicia
+            loadYears();
         </script>
     </body>
     </html>
