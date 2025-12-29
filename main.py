@@ -6,7 +6,6 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from typing import List
 
 app = FastAPI()
 
@@ -15,10 +14,12 @@ ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 temp_dir = "temp_files"
 output_filename = "Relatorio_Notas.xlsx"
 
+# --- FUNÇÕES AUXILIARES ---
 def formatar_moeda(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def pegar_valor(no, caminho, tipo=str):
+    """Busca valor de forma segura. Retorna 0.0 para numeros se nao encontrar."""
     if no is None: return tipo(0) if tipo in [float, int] else ""
     try:
         r = no.find(caminho, ns)
@@ -28,6 +29,7 @@ def pegar_valor(no, caminho, tipo=str):
     except:
         return tipo(0) if tipo in [float, int] else ""
 
+# --- MOTOR DE EXTRAÇÃO (AGORA COMPLETO) ---
 def processar_xmls(pasta_xml):
     arquivos = glob.glob(f"{pasta_xml}/**/*.xml", recursive=True)
     arquivos += glob.glob(f"{pasta_xml}/**/*.XML", recursive=True)
@@ -47,12 +49,13 @@ def processar_xmls(pasta_xml):
             
             if inf_nfe is None: continue
 
-            # --- DADOS ---
+            # --- BLOCOS PRINCIPAIS ---
             ide = inf_nfe.find('nfe:ide', ns)
             emit = inf_nfe.find('nfe:emit', ns)
             dest = inf_nfe.find('nfe:dest', ns)
             total_icms = inf_nfe.find('nfe:total/nfe:ICMSTot', ns)
             
+            # --- DADOS GERAIS ---
             chave = pegar_valor(root.find('nfe:protNFe/nfe:infProt', ns), 'nfe:chNFe')
             if not chave: chave = inf_nfe.attrib.get('Id', '')[3:]
             
@@ -60,13 +63,13 @@ def processar_xmls(pasta_xml):
             data_nfe = data_raw[:10]
             ano, mes = data_nfe[:4], data_nfe[5:7]
 
-            # --- LOOP ITENS ---
+            # --- LOOP DOS PRODUTOS (COM TODOS OS CAMPOS) ---
             dets = inf_nfe.findall('nfe:det', ns)
             for det in dets:
                 prod = det.find('nfe:prod', ns)
                 imposto = det.find('nfe:imposto', ns)
                 
-                # ... (Lógica de impostos igual anterior) ...
+                # Variáveis de Imposto do ITEM
                 cst_csosn = ""
                 bc_icms_item = 0.0
                 aliq_icms_item = 0.0
@@ -75,6 +78,7 @@ def processar_xmls(pasta_xml):
                 vr_ipi_item = 0.0
                 
                 if imposto is not None:
+                    # ICMS / CST / CSOSN
                     icms_node = imposto.find('nfe:ICMS', ns)
                     if icms_node:
                         for child in icms_node:
@@ -82,6 +86,8 @@ def processar_xmls(pasta_xml):
                             bc_icms_item = pegar_valor(child, 'nfe:vBC', float)
                             aliq_icms_item = pegar_valor(child, 'nfe:pICMS', float)
                             vr_icms_item = pegar_valor(child, 'nfe:vICMS', float)
+
+                    # IPI
                     ipi_node = imposto.find('nfe:IPI', ns)
                     if ipi_node:
                         ipitrib = ipi_node.find('nfe:IPITrib', ns)
@@ -89,58 +95,98 @@ def processar_xmls(pasta_xml):
                             aliq_ipi_item = pegar_valor(ipitrib, 'nfe:pIPI', float)
                             vr_ipi_item = pegar_valor(ipitrib, 'nfe:vIPI', float)
 
+                # --- MONTAGEM DA LINHA (TODAS AS COLUNAS) ---
                 item = {
-                    'Mês': mes, 'Ano': ano, 'Chave': chave,
-                    'Emitente': pegar_valor(emit, 'nfe:xNome'),
-                    'CNPJ Emitente': pegar_valor(emit, 'nfe:CNPJ'),
+                    'Mês': mes,
+                    'Ano': ano,
+                    'Chave Acesso NFe': "'" + chave,
+                    'Inscrição Destinatário': pegar_valor(dest, 'nfe:IE'),
+                    'Inscrição Emitente': pegar_valor(emit, 'nfe:IE'),
+                    'Razão Social Emitente': pegar_valor(emit, 'nfe:xNome'),
+                    'Cnpj Emitente': pegar_valor(emit, 'nfe:CNPJ'),
+                    'UF Emitente': pegar_valor(emit, 'nfe:enderEmit/nfe:UF'),
                     'Nr NFe': pegar_valor(ide, 'nfe:nNF'),
-                    'Data': data_nfe,
+                    'Série': pegar_valor(ide, 'nfe:serie'),
+                    'Data NFe': data_nfe,
+                    
+                    # Totais da Nota
+                    'BC ICMS Total': pegar_valor(total_icms, 'nfe:vBC', float),
+                    'ICMS Total': pegar_valor(total_icms, 'nfe:vICMS', float),
+                    'BC ST Total': pegar_valor(total_icms, 'nfe:vBCST', float),
+                    'ICMS ST Total': pegar_valor(total_icms, 'nfe:vST', float),
+                    'Desc Total': pegar_valor(total_icms, 'nfe:vDesc', float),
+                    'IPI Total': pegar_valor(total_icms, 'nfe:vIPI', float),
+                    'Total Produtos': pegar_valor(total_icms, 'nfe:vProd', float),
                     'Total NFe': pegar_valor(total_icms, 'nfe:vNF', float),
-                    'Produto': pegar_valor(prod, 'nfe:xProd'),
-                    'NCM': pegar_valor(prod, 'nfe:NCM'),
-                    'CFOP': pegar_valor(prod, 'nfe:CFOP'),
+                    
+                    # Dados do Produto
+                    'Descrição Produto NFe': pegar_valor(prod, 'nfe:xProd'),
+                    'NCM na NFe': pegar_valor(prod, 'nfe:NCM'),
+                    'CST': cst_csosn,
+                    'CFOP NFe': pegar_valor(prod, 'nfe:CFOP'),
                     'Qtde': pegar_valor(prod, 'nfe:qCom', float),
-                    'Vr Total Item': pegar_valor(prod, 'nfe:vProd', float),
-                    # ... (Adicione os outros campos aqui se quiser na planilha final) ...
+                    'Unid': pegar_valor(prod, 'nfe:uCom'),
+                    'Vr Unit': pegar_valor(prod, 'nfe:vUnCom', float),
+                    'Vr Total': pegar_valor(prod, 'nfe:vProd', float),
+                    'Desconto Item': pegar_valor(prod, 'nfe:vDesc', float),
+                    
+                    # Impostos do Item
+                    'Base de Cálculo ICMS': bc_icms_item,
+                    'Aliq ICMS': aliq_icms_item,
+                    'Vr ICMS': vr_icms_item,
+                    'Aliq IPI': aliq_ipi_item,
+                    'Vr IPI': vr_ipi_item
                 }
                 dados.append(item)
         except Exception as e:
             erros.append(f"Erro em {os.path.basename(arq)}: {str(e)}")
 
+    # --- ORDENAÇÃO E PREPARAÇÃO PARA EXPORTAÇÃO ---
+    colunas_ordem = [
+        'Mês', 'Ano', 'Chave Acesso NFe', 'Inscrição Destinatário', 'Inscrição Emitente', 
+        'Razão Social Emitente', 'Cnpj Emitente', 'UF Emitente', 'Nr NFe', 'Série', 'Data NFe', 
+        'BC ICMS Total', 'ICMS Total', 'BC ST Total', 'ICMS ST Total', 'Desc Total', 'IPI Total', 
+        'Total Produtos', 'Total NFe', 'Descrição Produto NFe', 'NCM na NFe', 'CST', 'CFOP NFe', 
+        'Qtde', 'Unid', 'Vr Unit', 'Vr Total', 'Desconto Item', 'Base de Cálculo ICMS', 
+        'Aliq ICMS', 'Vr ICMS', 'Aliq IPI', 'Vr IPI'
+    ]
+    
     df = pd.DataFrame(dados)
     
-    # --- GERAÇÃO DE ESTATÍSTICAS (PROVA REAL) ---
+    # Garante a ordem e existência das colunas
+    if not df.empty:
+        for col in colunas_ordem:
+            if col not in df.columns: df[col] = ""
+        df = df[colunas_ordem]
+
+    # --- ESTATÍSTICAS PARA O DASHBOARD ---
     stats = {}
     if not df.empty:
-        # 1. Totais Gerais
-        qtd_arquivos = len(arquivos)
-        qtd_linhas_produtos = len(df)
-        # Conta notas únicas pela chave (remove duplicatas de produtos para contar notas)
-        notas_unicas = df.drop_duplicates(subset=['Chave'])
+        # Conta notas únicas (baseado na chave de acesso)
+        notas_unicas = df.drop_duplicates(subset=['Chave Acesso NFe'])
+        
+        # Totais
         qtd_notas = len(notas_unicas)
         valor_total_notas = notas_unicas['Total NFe'].sum()
+        qtd_produtos = len(df)
         
-        # 2. Agrupamento por Mês/Ano (usando as notas únicas para não somar o total da nota várias vezes)
+        # Agrupamento por Mês
         por_periodo = notas_unicas.groupby(['Ano', 'Mês']).agg(
-            Qtd_Notas=('Chave', 'count'),
+            Qtd_Notas=('Chave Acesso NFe', 'count'),
             Valor_Total=('Total NFe', 'sum')
         ).reset_index().to_dict('records')
-        
-        # 3. Top Emitentes
-        top_emitentes = notas_unicas['Emitente'].value_counts().head(5).to_dict()
 
         stats = {
             'sucesso': True,
-            'qtd_arquivos_lidos': qtd_arquivos,
+            'qtd_arquivos_lidos': len(arquivos),
             'qtd_notas_unicas': qtd_notas,
-            'qtd_produtos_total': qtd_linhas_produtos,
+            'qtd_produtos_total': qtd_produtos,
             'valor_total_geral': valor_total_notas,
             'periodos': por_periodo,
-            'top_emitentes': top_emitentes,
             'erros': erros
         }
     else:
-        stats = {'sucesso': False, 'msg': 'Nenhum dado encontrado nos XMLs.'}
+        stats = {'sucesso': False, 'msg': 'Nenhuma nota processada com sucesso.'}
 
     return df, stats
 
@@ -151,7 +197,7 @@ async def download_excel():
     file_path = os.path.join(temp_dir, output_filename)
     if os.path.exists(file_path):
         return FileResponse(file_path, filename=output_filename, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    return {"error": "Arquivo não encontrado"}
+    return {"error": "Arquivo não processado ainda."}
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -170,12 +216,13 @@ async def upload_file(file: UploadFile = File(...)):
         
     df, stats = processar_xmls(temp_dir)
     
-    # Salva o Excel para download posterior
+    # Salva o Excel Completo
     excel_path = os.path.join(temp_dir, output_filename)
     df.to_excel(excel_path, index=False)
     
     return JSONResponse(stats)
 
+# --- FRONTEND (HTML DASHBOARD IGUAL AO ANTERIOR) ---
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
@@ -189,8 +236,6 @@ async def home():
         <style>
             body { font-family: 'Inter', sans-serif; background: #f8fafc; color: #1e293b; margin: 0; padding: 20px; }
             .container { max-width: 900px; margin: 0 auto; }
-            
-            /* Upload Card */
             .card { background: white; padding: 40px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); text-align: center; margin-bottom: 30px; }
             .drop-zone { border: 2px dashed #cbd5e1; border-radius: 12px; padding: 30px; cursor: pointer; transition: 0.3s; background: #f1f5f9; position: relative;}
             .drop-zone:hover { border-color: #3b82f6; background: #e0f2fe; }
@@ -198,14 +243,12 @@ async def home():
             .btn { background: #3b82f6; color: white; border: none; padding: 15px 30px; border-radius: 8px; font-weight: 600; font-size: 16px; cursor: pointer; margin-top: 20px; width: 100%; }
             .btn:disabled { background: #94a3b8; cursor: not-allowed; }
             
-            /* Dashboard Styles (Escondido inicialmente) */
             #dashboard { display: none; }
             .grid-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
             .stat-card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); border-left: 5px solid #3b82f6; }
             .stat-value { font-size: 24px; font-weight: 700; color: #0f172a; margin-top: 5px; }
             .stat-label { font-size: 14px; color: #64748b; font-weight: 600; }
             
-            /* Tabela */
             .table-container { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); overflow-x: auto; }
             table { width: 100%; border-collapse: collapse; margin-top: 10px; }
             th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e2e8f0; }
@@ -213,8 +256,6 @@ async def home():
             
             .btn-download { background: #10b981; margin-top: 20px; display: block; text-decoration: none; text-align: center; padding: 15px; border-radius: 8px; color: white; font-weight: bold; font-size: 18px; }
             .btn-download:hover { background: #059669; }
-            
-            /* Loader */
             .loader { border: 3px solid rgba(255,255,255,0.3); border-top: 3px solid white; border-radius: 50%; width: 20px; height: 20px; animation: spin 1s linear infinite; display: none; vertical-align: middle; margin-right: 10px; }
             @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         </style>
@@ -239,23 +280,18 @@ async def home():
 
             <div id="dashboard">
                 <h2>📋 Resumo da Auditoria (Prova Real)</h2>
-                
                 <div class="grid-stats">
                     <div class="stat-card">
-                        <div class="stat-label">Total de Notas</div>
+                        <div class="stat-label">Total de Notas (Únicas)</div>
                         <div class="stat-value" id="resQtdNotas">0</div>
                     </div>
                     <div class="stat-card" style="border-color: #10b981;">
-                        <div class="stat-label">Valor Total (R$)</div>
+                        <div class="stat-label">Valor Total NFe</div>
                         <div class="stat-value" id="resValorTotal" style="color:#059669">R$ 0,00</div>
                     </div>
                     <div class="stat-card" style="border-color: #f59e0b;">
-                        <div class="stat-label">Itens/Produtos</div>
+                        <div class="stat-label">Total Produtos (Linhas)</div>
                         <div class="stat-value" id="resQtdItens">0</div>
-                    </div>
-                    <div class="stat-card" style="border-color: #6366f1;">
-                        <div class="stat-label">Arquivos Processados</div>
-                        <div class="stat-value" id="resQtdArquivos">0</div>
                     </div>
                 </div>
 
@@ -270,15 +306,11 @@ async def home():
                                 <th>Valor Total</th>
                             </tr>
                         </thead>
-                        <tbody id="tabelaMeses">
-                            </tbody>
+                        <tbody id="tabelaMeses"></tbody>
                     </table>
                 </div>
 
-                <a href="/download" class="btn-download">
-                    📥 Tudo Certo! Baixar Relatório Excel
-                </a>
-                
+                <a href="/download" class="btn-download">📥 Baixar Relatório Completo (Excel)</a>
                 <br>
                 <button onclick="location.reload()" style="background:none; border:none; color:#64748b; cursor:pointer; text-decoration:underline; width:100%">Processar outro arquivo</button>
             </div>
@@ -316,26 +348,16 @@ async def home():
                     const data = await res.json();
 
                     if(data.sucesso) {
-                        // Preencher Dashboard
                         document.getElementById('resQtdNotas').textContent = data.qtd_notas_unicas;
                         document.getElementById('resValorTotal').textContent = formatBRL(data.valor_total_geral);
                         document.getElementById('resQtdItens').textContent = data.qtd_produtos_total;
-                        document.getElementById('resQtdArquivos').textContent = data.qtd_arquivos_lidos;
 
-                        // Preencher Tabela
                         const tbody = document.getElementById('tabelaMeses');
                         tbody.innerHTML = '';
                         data.periodos.forEach(p => {
-                            const tr = `<tr>
-                                <td>${p.Ano}</td>
-                                <td>${p.Mês}</td>
-                                <td>${p.Qtd_Notas}</td>
-                                <td>${formatBRL(p.Valor_Total)}</td>
-                            </tr>`;
-                            tbody.innerHTML += tr;
+                            tbody.innerHTML += `<tr><td>${p.Ano}</td><td>${p.Mês}</td><td>${p.Qtd_Notas}</td><td>${formatBRL(p.Valor_Total)}</td></tr>`;
                         });
 
-                        // Trocar tela
                         uploadCard.style.display = 'none';
                         dashboard.style.display = 'block';
                     } else {
