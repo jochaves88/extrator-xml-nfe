@@ -28,7 +28,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 class NFe(Base):
-    __tablename__ = "notas_fiscais_v6" # V6: Tabela nova para garantir os novos campos (CST, Aliquotas)
+    __tablename__ = "notas_fiscais_v7" # V7: Inclusão de CEST e ST Item
     chave_item = Column(String, primary_key=True, index=True)
     chave_acesso = Column(String)
     ano = Column(String)
@@ -72,7 +72,7 @@ def parse_xml(filepath):
         dt = datetime.now()
         if len(dt_str) >= 10: dt = datetime.strptime(dt_str[:10], '%Y-%m-%d')
 
-        # Extração de totais (Cabeçalho)
+        # Totais Cabeçalho
         v_bc_tot = get_val(total, 'nfe:vBC', float)
         v_icms_tot = get_val(total, 'nfe:vICMS', float)
         v_bcst_tot = get_val(total, 'nfe:vBCST', float)
@@ -87,22 +87,24 @@ def parse_xml(filepath):
             prod = det.find('nfe:prod', ns_map)
             imposto = det.find('nfe:imposto', ns_map)
             
-            # --- LÓGICA AVANÇADA PARA CST E IMPOSTOS DO ITEM ---
-            # CST pode estar em vários lugares (ICMS00, ICMS10, CSOSN101, etc)
-            # Buscamos recursivamente (.//) dentro da tag imposto
+            # --- EXTRAÇÃO DE CAMPOS ---
             cst = get_val(imposto, './/nfe:CST')
-            if not cst: cst = get_val(imposto, './/nfe:CSOSN') # Se for Simples Nacional
+            if not cst: cst = get_val(imposto, './/nfe:CSOSN')
             
-            # Valores Específicos do Item (Busca profunda)
+            # ICMS Normal (Item)
             v_bc_item = get_val(imposto, './/nfe:ICMS//nfe:vBC', float)
             p_icms_item = get_val(imposto, './/nfe:ICMS//nfe:pICMS', float)
             v_icms_item = get_val(imposto, './/nfe:ICMS//nfe:vICMS', float)
             
+            # ICMS ST (Item) - NOVO
+            v_bcst_item = get_val(imposto, './/nfe:ICMS//nfe:vBCST', float)
+            v_icmsst_item = get_val(imposto, './/nfe:ICMS//nfe:vICMSST', float)
+            
+            # IPI (Item)
             p_ipi_item = get_val(imposto, './/nfe:IPI//nfe:pIPI', float)
             v_ipi_item = get_val(imposto, './/nfe:IPI//nfe:vIPI', float)
 
             row = {
-                # CAMPOS SOLICITADOS EXATAMENTE
                 'Mês': str(dt.month).zfill(2),
                 'Ano': str(dt.year),
                 'Chave Acesso NFe': chave,
@@ -115,7 +117,7 @@ def parse_xml(filepath):
                 'Série': get_val(ide, 'nfe:serie'),
                 'Data NFe': dt.strftime('%d/%m/%Y'),
                 
-                # Totais
+                # Totais da Nota
                 'BC ICMS Total': v_bc_tot,
                 'ICMS Total': v_icms_tot,
                 'BC ST Total': v_bcst_tot,
@@ -125,9 +127,10 @@ def parse_xml(filepath):
                 'Total Produtos': v_prod_tot,
                 'Total NFe': v_nf_tot,
                 
-                # Item
+                # Detalhes do Item
                 'Descrição Produto NFe': get_val(prod, 'nfe:xProd'),
                 'NCM na NFe': get_val(prod, 'nfe:NCM'),
+                'CEST': get_val(prod, 'nfe:CEST'), # NOVO
                 'CST': cst,
                 'CFOP NFe': get_val(prod, 'nfe:CFOP'),
                 'Qtde': get_val(prod, 'nfe:qCom', float),
@@ -136,10 +139,14 @@ def parse_xml(filepath):
                 'Vr Total': get_val(prod, 'nfe:vProd', float),
                 'Desconto Item': get_val(prod, 'nfe:vDesc', float),
                 
-                # Impostos Detalhados do Item
+                # Impostos do Item
                 'Base de Cálculo ICMS': v_bc_item,
                 'Aliq ICMS': p_icms_item,
                 'Vr ICMS': v_icms_item,
+                
+                'Base Calc ICMS ST Item': v_bcst_item, # NOVO
+                'Vr ICMS ST Item': v_icmsst_item,      # NOVO
+                
                 'Aliq IPI': p_ipi_item,
                 'Vr IPI': v_ipi_item
             }
@@ -159,6 +166,7 @@ def parse_xml(filepath):
 # --- ROTAS ---
 @app.post("/upload")
 async def upload(files: List[UploadFile] = File(...)):
+    # Limpa temp
     if os.path.exists(TEMP_DIR): 
         shutil.rmtree(TEMP_DIR)
         os.makedirs(TEMP_DIR)
@@ -223,34 +231,34 @@ async def gerar(anos: str = Form(...), meu_cnpj: str = Form("")):
         data = [eval(r.dados_json) for r in res]
         df = pd.DataFrame(data)
 
-        # Lógica para o Resumo na Tela (Entrada vs Saida)
-        # Nota: Mantemos isso para a tela, mas NÃO colocamos no Excel pois você pediu ordem exata
+        # Lógica de Classificação (Entrada/Saida) para o Resumo
         def classificar(row):
             if not meu_cnpj: return "Indefinido"
             cnpj_limpo = ''.join(filter(str.isdigit, meu_cnpj))
-            emit = ''.join(filter(str.isdigit, str(row.get('Cnpj Emitente', '')))) # Usando a chave exata
-            dest = ''.join(filter(str.isdigit, str(row.get('Destinatário CNPJ', '')))) # Chave pode variar se XML for ruim, mas tentamos
+            emit = ''.join(filter(str.isdigit, str(row.get('Cnpj Emitente', ''))))
+            dest = ''.join(filter(str.isdigit, str(row.get('Destinatário CNPJ', '')))) # Ajuste chave se necessário
             if emit == cnpj_limpo: return "SAÍDA"
             if dest == cnpj_limpo: return "ENTRADA"
             return "OUTROS"
 
-        if meu_cnpj:
-            df['__temp_tipo'] = df.apply(classificar, axis=1)
+        if meu_cnpj: df['__temp_tipo'] = df.apply(classificar, axis=1)
 
         # Ordenação Cronológica
         df = df.sort_values(by=['Ano', 'Mês', 'Data NFe'])
 
-        # --- DEFINIÇÃO ESTRITA DAS COLUNAS (ORDEM SOLICITADA) ---
+        # --- ORDEM DAS COLUNAS (ATUALIZADA) ---
         cols = [
             'Mês', 'Ano', 'Chave Acesso NFe', 'Inscrição Destinatário', 'Inscrição Emitente',
             'Razão Social Emitente', 'Cnpj Emitente', 'UF Emitente', 'Nr NFe', 'Série', 'Data NFe',
             'BC ICMS Total', 'ICMS Total', 'BC ST Total', 'ICMS ST Total', 'Desc Total', 'IPI Total',
-            'Total Produtos', 'Total NFe', 'Descrição Produto NFe', 'NCM na NFe', 'CST', 'CFOP NFe',
+            'Total Produtos', 'Total NFe', 'Descrição Produto NFe', 'NCM na NFe', 
+            'CEST', 'CST', 'CFOP NFe', # CEST inserido aqui
             'Qtde', 'Unid', 'Vr Unit', 'Vr Total', 'Desconto Item', 
-            'Base de Cálculo ICMS', 'Aliq ICMS', 'Vr ICMS', 'Aliq IPI', 'Vr IPI'
+            'Base de Cálculo ICMS', 'Aliq ICMS', 'Vr ICMS', 
+            'Base Calc ICMS ST Item', 'Vr ICMS ST Item', # Campos ST inseridos aqui
+            'Aliq IPI', 'Vr IPI'
         ]
         
-        # Garante que só essas colunas saiam e nessa ordem
         df = df.reindex(columns=cols).fillna("")
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -258,12 +266,11 @@ async def gerar(anos: str = Form(...), meu_cnpj: str = Form("")):
         filepath = os.path.join(REPORTS_DIR, filename)
         df.to_excel(filepath, index=False)
 
-        # Prova Real
+        # Dados para o Frontend
         v_itens = df['Vr Total'].replace('', 0).astype(float).sum()
         df_unicas = df.drop_duplicates(subset=['Chave Acesso NFe'])
         v_notas = df_unicas['Total NFe'].replace('', 0).astype(float).sum()
         
-        # Resumo Entradas/Saidas (Apenas contagem visual)
         resumo_msg = "Sem filtro de CNPJ"
         if meu_cnpj and '__temp_tipo' in df:
             entradas = len(df_unicas[df_unicas['__temp_tipo'] == 'ENTRADA'])
@@ -295,7 +302,7 @@ async def home():
     <html lang="pt-br">
     <head>
         <meta charset="UTF-8">
-        <title>Extrator Fiscal V6</title>
+        <title>Extrator Fiscal V7</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
         <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
